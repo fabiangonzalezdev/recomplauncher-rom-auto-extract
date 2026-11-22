@@ -1,0 +1,85 @@
+name: Flatpak
+
+# Builds the Flathub package from the checked-out source. Separate from the PR checks, so it
+# isn't one of the required ones; it runs when packaging, the Rust code or the lockfile change.
+on:
+  pull_request:
+    paths:
+      - packaging/flatpak/**
+      - src-tauri/**
+      - ui/**
+      - .github/workflows/flatpak.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flatpak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flatpak:
+    name: Build Flatpak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare the build files
+        shell: bash
+        run: |
+          cd packaging/flatpak
+          git clone --depth 1 https://github.com/flathub/shared-modules shared-modules
+          curl -fsSL -o flatpak-cargo-generator.py https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+          pip3 install --break-system-packages aiohttp tomlkit PyYAML
+          python3 flatpak-cargo-generator.py ../../src-tauri/Cargo.lock -o cargo-sources.json
+          # The release manifest fetches a tagged commit; here the build uses this checkout.
+          python3 - <<'PY'
+          import yaml
+          p = "com.recomplauncher.RecompLauncher.yml"
+          m = yaml.safe_load(open(p))
+          mod = m["modules"][-1]
+          mod["sources"][0] = {"type": "dir", "path": "../.."}
+          yaml.safe_dump(m, open("ci-manifest.yml", "w"), sort_keys=False)
+          PY
+
+      # The image's runtimes sit in a read-only layer of the container's overlay filesystem, and
+      # flatpak can't update them there once Flathub has a newer one ("Invalid cross-device
+      # link"). A copy on the runner's own disk updates fine.
+      - name: Move the Flatpak installation onto the runner's disk
+        shell: bash
+        run: |
+          dir="$RUNNER_TEMP/flatpak-system"
+          cp -a /var/lib/flatpak "$dir"
+          echo "FLATPAK_SYSTEM_DIR=$dir" >> "$GITHUB_ENV"
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: RecompLauncher.flatpak
+          manifest-path: packaging/flatpak/ci-manifest.yml
+          # Reused while the crates and the manifest stay the same.
+          cache-key: flatpak-builder-${{ hashFiles('src-tauri/Cargo.lock', 'packaging/flatpak/com.recomplauncher.RecompLauncher.yml') }}
+          restore-cache: true
+
+      # Flathub's own checks. Only errors fail it (the release's missing commit is a warning).
+      # Its check that recomplauncher.com answers is about the website, not the packaging: when the
+      # site is slow or down it's reported, not a failure. Flathub checks it again on submission.
+      - name: Lint the manifest and app data
+        run: |
+          flatpak install -y --noninteractive flathub org.flatpak.Builder
+          cd packaging/flatpak
+          out=$(flatpak run --command=flatpak-builder-lint org.flatpak.Builder manifest com.recomplauncher.RecompLauncher.yml) || true
+          echo "$out"
+          printf '%s' "$out" | python3 -c '
+          import json, sys
+          text = sys.stdin.read().strip()
+          errors = json.loads(text).get("errors", []) if text else []
+          if "appid-url-not-reachable" in errors:
+              print("::warning::recomplauncher.com did not answer the linter (appid-url-not-reachable)")
+          sys.exit(1 if [e for e in errors if e != "appid-url-not-reachable"] else 0)
+          '
+          flatpak run --command=flatpak-builder-lint org.flatpak.Builder appstream com.recomplauncher.RecompLauncher.metainfo.xml

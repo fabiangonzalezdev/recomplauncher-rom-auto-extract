@@ -1,0 +1,985 @@
+//! Settings → Keep Steam in Sync: every installed game that's ready to play is a non-Steam game in
+//! Steam, with its art, in a RecompLauncher collection, and leaves Steam when it's uninstalled.
+//!
+//! Steam reads its list of non-Steam games (shortcuts.vdf) and its collections only when it
+//! starts, and writes them back when it closes. So changes are written only while Steam is closed:
+//! a check every couple of minutes catches it closed, and Sync Now closes and reopens it.
+//!
+//! Only entries the launcher made are ever taken out: they start the launcher with `--play <id>`,
+//! or one of its Linux launch scripts. Games the player added to Steam themselves stay.
+//!
+//! Remove All takes every one of those out again at once (and, if asked, the launcher's own Big
+//! Picture entry), for a player who's done with them or leaving the launcher.
+
+use crate::shortcuts::{self, Node};
+use crate::{games, library::Installed, trail, App, Error, Res};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{AppHandle, Manager, State};
+
+/// The tag on the launcher's entries in shortcuts.vdf (shortcuts::add_shortcut writes it).
+const TAG: &str = "RecompLauncher";
+/// The collection's id in Steam. Fixed, so the launcher finds its own collection again on every
+/// PC the player signs in on (collections go with their Steam account).
+const COLLECTION_ID: &str = "rl-recomplauncher";
+const COLLECTION_NAME: &str = "RecompLauncher";
+/// How often the launcher looks for Steam being closed, to write what changed.
+const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A game that should be in Steam, as the launcher writes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Want {
+    pub id: String,
+    pub name: String,
+    /// The program Steam starts, without quotes.
+    pub exe: String,
+    pub launch: String,
+}
+
+impl Want {
+    pub fn app_id(&self) -> u32 {
+        shortcuts::steam_app_id(&format!("\"{}\"", self.exe), &self.name)
+    }
+}
+
+/// One of the launcher's entries already in a shortcuts.vdf.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Owned {
+    /// Its key in the file ("0", "1", ...).
+    pub key: String,
+    /// The game it plays.
+    pub id: String,
+    pub app_id: u32,
+    pub name: String,
+    pub exe: String,
+    pub launch: String,
+}
+
+/// What has to change in one account's shortcuts.vdf.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Plan {
+    pub add: Vec<Want>,
+    pub remove: Vec<Owned>,
+}
+
+impl Plan {
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.remove.is_empty()
+    }
+}
+
+/// The game a `--play <id>` launch option plays.
+pub fn played_id(launch: &str) -> Option<String> {
+    let (_, rest) = launch.rsplit_once("--play ")?;
+    let id = rest.trim().trim_matches(['"', '\'']);
+    if id.is_empty() || id.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// Made by the launcher: it carries the launcher's tag, or starts the launcher itself.
+fn made_by_launcher(e: &Node, exe: &str, launch: &str) -> bool {
+    let tagged = match e.get("tags") {
+        Some(Node::Map(tags)) => tags.iter().any(|(_, t)| matches!(t, Node::Str(s) if s == TAG)),
+        _ => false,
+    };
+    let starts_launcher = exe.to_lowercase().contains("recomplauncher") || launch.to_lowercase().contains("recomplauncher");
+    tagged || starts_launcher
+}
+
+/// An entry's app id: the one Steam stored, else worked out the way Steam does.
+fn app_id_of(e: &Node) -> u32 {
+    match e.get("appid") {
+        Some(Node::Int(n)) => *n as u32,
+        _ => shortcuts::steam_app_id(e.str("Exe"), e.str("AppName")),
+    }
+}
+
+/// The launcher's own entry (RecompLauncher in Steam): it opens the launcher in Big Picture mode.
+fn is_launcher_entry(e: &Node) -> bool {
+    let exe = e.str("Exe").trim_matches('"');
+    let launch = e.str("LaunchOptions");
+    made_by_launcher(e, exe, launch) && launch.trim_end().ends_with("--bigpicture")
+}
+
+/// Everything Remove All takes out of a shortcuts.vdf's list: the launcher's games, and with
+/// `launcher` its own entry too (an Owned with no game id).
+pub fn all_of_ours(list: &[(String, Node)], script_game: &dyn Fn(&str) -> Option<String>, launcher: bool) -> Vec<Owned> {
+    let mut out = owned(list, script_game);
+    if !launcher {
+        return out;
+    }
+    for (key, e) in list.iter().filter(|(_, e)| is_launcher_entry(e)) {
+        let exe = e.str("Exe").trim_matches('"').to_string();
+        let launch = e.str("LaunchOptions").to_string();
+        out.push(Owned { key: key.clone(), id: String::new(), app_id: app_id_of(e), name: e.str("AppName").to_string(), exe, launch });
+    }
+    out
+}
+
+/// The launcher's game entries in a shortcuts.vdf's list. `script_game` reads which game one of
+/// its Linux launch scripts plays. The launcher's own entry (Big Picture mode) isn't one.
+pub fn owned(list: &[(String, Node)], script_game: &dyn Fn(&str) -> Option<String>) -> Vec<Owned> {
+    let mut out = vec![];
+    for (key, e) in list {
+        let exe = e.str("Exe").trim_matches('"').to_string();
+        let launch = e.str("LaunchOptions").to_string();
+        let id = match played_id(&launch) {
+            Some(id) if made_by_launcher(e, &exe, &launch) => Some(id),
+            Some(_) => None,
+            None => script_game(&exe),
+        };
+        let Some(id) = id else { continue };
+        out.push(Owned { key: key.clone(), id, app_id: app_id_of(e), name: e.str("AppName").to_string(), exe, launch });
+    }
+    out
+}
+
+/// What changes for Steam to have exactly `wants` of the launcher's games. An entry for a game
+/// that's installed but not ready to play yet (`keep`) stays: the player may have added it with
+/// Add to Steam on purpose. An entry that plays a wanted game the old way (another name, the
+/// launcher somewhere else) is replaced.
+pub fn plan(owned: &[Owned], wants: &[Want], keep: &BTreeSet<String>) -> Plan {
+    let mut matched = BTreeSet::new();
+    let mut add = vec![];
+    for w in wants {
+        let found = owned.iter().find(|o| !matched.contains(&o.key) && o.exe == w.exe && o.launch == w.launch && o.name == w.name);
+        match found {
+            Some(o) => {
+                matched.insert(o.key.clone());
+            }
+            None => add.push(w.clone()),
+        }
+    }
+    let remove = owned.iter().filter(|o| !matched.contains(&o.key) && !keep.contains(&o.id)).cloned().collect();
+    Plan { add, remove }
+}
+
+/// A shortcuts.vdf's content without the entries under `keys`. None when it can't be read.
+pub fn without(old: &[u8], keys: &BTreeSet<String>) -> Option<Vec<u8>> {
+    let mut top = shortcuts::parse_vdf(old)?;
+    for (k, v) in top.iter_mut() {
+        if !k.eq_ignore_ascii_case("shortcuts") {
+            continue;
+        }
+        let Node::Map(list) = v else { continue };
+        list.retain(|(key, _)| !keys.contains(key));
+        // Steam numbers its entries from 0, without gaps.
+        for (n, (key, _)) in list.iter_mut().enumerate() {
+            *key = n.to_string();
+        }
+    }
+    Some(shortcuts::write_vdf(&top))
+}
+
+/// The list of entries in a shortcuts.vdf's content (empty for a new file).
+fn entries(bytes: Option<&[u8]>) -> Option<Vec<(String, Node)>> {
+    let Some(b) = bytes.filter(|b| !b.is_empty()) else { return Some(vec![]) };
+    let top = shortcuts::parse_vdf(b)?;
+    let list = top.into_iter().find(|(k, _)| k.eq_ignore_ascii_case("shortcuts")).map(|(_, v)| v);
+    match list {
+        Some(Node::Map(l)) => Some(l),
+        _ => Some(vec![]),
+    }
+}
+
+// ---------- Steam's collections ----------
+
+/// Steam's collections file (cloudstorage/cloud-storage-namespace-1.json, a list of [key, record])
+/// with the RecompLauncher collection holding `add` and no longer `remove`. Games the player put
+/// in the collection themselves stay. Steam's other collections and settings stay as they are.
+/// The changed key comes back too, for the file of changes Steam still has to upload. None when
+/// nothing changes, or the file isn't the list Steam writes.
+pub fn with_collection(file: &str, add: &[u32], remove: &[u32], now: u64) -> Option<(String, String)> {
+    let mut list: Vec<Value> = serde_json::from_str(file).ok()?;
+    // Records are versioned by Steam Cloud; a new one goes in at the newest version.
+    let version = list.iter().filter_map(|x| x.get(1)?.get("version")?.as_str()?.parse::<u64>().ok()).max().unwrap_or(0);
+    let pos = collection_at(&list);
+    let key = match pos {
+        Some(i) => list[i][0].as_str()?.to_string(),
+        None => format!("user-collections.{COLLECTION_ID}"),
+    };
+    let old: Value = pos.and_then(|i| list[i][1].get("value")?.as_str().and_then(|v| serde_json::from_str(v).ok())).unwrap_or(Value::Null);
+    let id = old.get("id").and_then(Value::as_str).unwrap_or(COLLECTION_ID).to_string();
+    let had: Vec<u32> = old.get("added").and_then(Value::as_array).map(|a| a.iter().filter_map(|n| n.as_u64()).map(|n| n as u32).collect()).unwrap_or_default();
+    let mut apps: Vec<u32> = had.iter().copied().filter(|a| !remove.contains(a)).collect();
+    for a in add {
+        if !apps.contains(a) {
+            apps.push(*a);
+        }
+    }
+    let was_removed: Vec<u64> = old.get("removed").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
+    let removed: Vec<u64> = was_removed.iter().copied().filter(|r| !apps.contains(&(*r as u32))).collect();
+    if pos.is_some() && apps == had && removed == was_removed {
+        return None;
+    }
+    let value = json!({ "id": id, "name": COLLECTION_NAME, "added": apps, "removed": removed }).to_string();
+    let record = json!([key, { "key": key, "timestamp": now, "value": value, "version": version.to_string() }]);
+    match pos {
+        Some(i) => list[i] = record,
+        None => list.push(record),
+    }
+    Some((serde_json::to_string(&list).ok()?, key))
+}
+
+/// Steam's collections file after Remove All: `remove` out of the RecompLauncher collection, and
+/// the collection deleted once it holds no games (games the player put in it keep it). None when
+/// there's no collection or nothing changes. Same answer as with_collection.
+pub fn collection_without(file: &str, remove: &[u32], now: u64) -> Option<(String, String)> {
+    let list: Vec<Value> = serde_json::from_str(file).ok()?;
+    // with_collection would make a new, empty collection: there's nothing to take games out of.
+    collection_at(&list)?;
+    let taken = with_collection(file, &[], remove, now);
+    let after = taken.as_ref().map(|(f, _)| f.as_str()).unwrap_or(file);
+    deleted_if_empty(after, now).or(taken)
+}
+
+/// The collections file with the launcher's collection marked deleted, the way Steam marks one the
+/// player deletes, when it holds no games. None when it has games or is already deleted.
+fn deleted_if_empty(file: &str, now: u64) -> Option<(String, String)> {
+    let mut list: Vec<Value> = serde_json::from_str(file).ok()?;
+    let i = collection_at(&list)?;
+    let record = list[i].get(1)?;
+    if record.get("is_deleted").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let value: Value = serde_json::from_str(record.get("value")?.as_str()?).ok()?;
+    let has_games = value.get("added").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+    if has_games {
+        return None;
+    }
+    let key = list[i][0].as_str()?.to_string();
+    let version = record.get("version").cloned().unwrap_or_else(|| json!("0"));
+    list[i] = json!([key, { "key": key, "timestamp": now, "is_deleted": true, "version": version }]);
+    Some((serde_json::to_string(&list).ok()?, key))
+}
+
+/// Where the launcher's collection is in the list: its own id, or one the player named
+/// RecompLauncher. A collection deleted in Steam counts as gone (a new one is made).
+fn collection_at(list: &[Value]) -> Option<usize> {
+    let own_key = format!("user-collections.{COLLECTION_ID}");
+    let live = |x: &Value| x.get(1).map(|r| !r.get("is_deleted").and_then(Value::as_bool).unwrap_or(false)).unwrap_or(false);
+    let named = |x: &Value| {
+        let key = x.get(0).and_then(Value::as_str).unwrap_or("");
+        let value = x.get(1).and_then(|r| r.get("value")).and_then(Value::as_str).unwrap_or("");
+        key.starts_with("user-collections.") && serde_json::from_str::<Value>(value).ok().and_then(|v| v.get("name").and_then(Value::as_str).map(|n| n == COLLECTION_NAME)).unwrap_or(false)
+    };
+    let own = list.iter().position(|x| x.get(0).and_then(Value::as_str) == Some(own_key.as_str()));
+    if let Some(i) = own.filter(|i| live(&list[*i])) {
+        return Some(i);
+    }
+    if let Some(i) = list.iter().position(|x| live(x) && named(x)) {
+        return Some(i);
+    }
+    // Ours, deleted: written over, so it doesn't sit there twice.
+    own
+}
+
+/// Steam's list of records changed on this PC and not uploaded yet, with `key` in it: Steam Cloud
+/// then takes the new collection instead of putting the old one back.
+pub fn with_modified(file: &str, key: &str) -> Option<String> {
+    let mut keys: Vec<Value> = if file.trim().is_empty() { vec![] } else { serde_json::from_str(file).ok()? };
+    if keys.iter().any(|k| k.as_str() == Some(key)) {
+        return None;
+    }
+    keys.push(Value::String(key.to_string()));
+    serde_json::to_string(&keys).ok()
+}
+
+/// Write a file through a temporary copy beside it, so Steam never finds half of one.
+fn write_whole(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = file.with_extension("recomplauncher-tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, file)
+}
+
+/// Steam's collections file as it was before the launcher first wrote it stays beside it, like the
+/// shortcuts file's backup, so the player's collections can always be put back by hand.
+fn keep_collections_backup(dir: &Path, old: &str) {
+    let backup = dir.join("cloud-storage-namespace-1.json.recomplauncher-backup");
+    if !backup.exists() {
+        let _ = fs::write(backup, old);
+    }
+}
+
+/// Put the collection right in one account's cloud storage folder. Ok(false): nothing to change.
+fn sync_collection(cfg: &Path, add: &[u32], remove: &[u32]) -> std::io::Result<bool> {
+    write_collections(cfg, |old| with_collection(old, add, remove, crate::library::now()))
+}
+
+/// Change one account's collections file with `change` (the new file and the changed key, or None
+/// for nothing to change), keeping a backup and telling Steam Cloud. Ok(false): nothing changed.
+fn write_collections(cfg: &Path, change: impl FnOnce(&str) -> Option<(String, String)>) -> std::io::Result<bool> {
+    let dir = cfg.join("cloudstorage");
+    let file = dir.join("cloud-storage-namespace-1.json");
+    // No file yet (an account that hasn't opened the library on this PC): Steam makes it, and the
+    // next sync after that fills the collection.
+    let Ok(old) = fs::read_to_string(&file) else { return Ok(false) };
+    let Some((new, key)) = change(&old) else { return Ok(false) };
+    let modified = dir.join("cloud-storage-namespace-1.modified.json");
+    let old_mod = fs::read_to_string(&modified).unwrap_or_default();
+    keep_collections_backup(&dir, &old);
+    write_whole(&file, new.as_bytes())?;
+    if let Some(m) = with_modified(&old_mod, &key) {
+        write_whole(&modified, m.as_bytes())?;
+    }
+    Ok(true)
+}
+
+// ---------- one account ----------
+
+/// One Steam account's shortcuts and what has to change in them.
+struct Account {
+    cfg: PathBuf,
+    old: Option<Vec<u8>>,
+    plan: Plan,
+    /// The app ids of the launcher's games that stay or come in: what the collection holds.
+    apps: Vec<u32>,
+}
+
+fn account(user: &Path, data: &Path, wants: &[Want], keep: &BTreeSet<String>) -> Option<Account> {
+    account_with(user, data, &|mine| plan(mine, wants, keep))
+}
+
+/// One account, with `make_plan` saying what changes given the launcher's entries already there.
+fn account_with(user: &Path, data: &Path, make_plan: &dyn Fn(&[Owned]) -> Plan) -> Option<Account> {
+    let cfg = user.join("config");
+    let old = fs::read(cfg.join("shortcuts.vdf")).ok();
+    // Something in it the launcher can't read: the player's shortcuts are left alone.
+    let list = entries(old.as_deref())?;
+    let mine = owned(&list, &|exe| shortcuts::script_game(data, exe));
+    let plan = make_plan(&mine);
+    let gone: BTreeSet<u32> = plan.remove.iter().map(|o| o.app_id).collect();
+    let mut apps: Vec<u32> = mine.iter().map(|o| o.app_id).filter(|a| !gone.contains(a)).collect();
+    apps.extend(plan.add.iter().map(Want::app_id));
+    Some(Account { cfg, old, plan, apps })
+}
+
+/// The collection doesn't hold the launcher's games yet (or still holds ones that left).
+fn collection_behind(a: &Account) -> bool {
+    let removed: Vec<u32> = a.plan.remove.iter().map(|o| o.app_id).collect();
+    let file = fs::read_to_string(a.cfg.join("cloudstorage").join("cloud-storage-namespace-1.json"));
+    file.map(|f| with_collection(&f, &a.apps, &removed, 0).is_some()).unwrap_or(false)
+}
+
+/// The art and icon of each game coming in, by id.
+type Arts = BTreeMap<String, (Vec<(&'static str, Vec<u8>, &'static str)>, String)>;
+
+fn apply(a: &Account, arts: &Arts) -> Result<(), Error> {
+    let file = a.cfg.join("shortcuts.vdf");
+    if let Some(o) = &a.old {
+        shortcuts::keep_backup(&a.cfg, o);
+    }
+    let keys: BTreeSet<String> = a.plan.remove.iter().map(|o| o.key.clone()).collect();
+    let mut bytes = match &a.old {
+        Some(o) if !o.is_empty() => without(o, &keys).ok_or_else(|| Error::Msg("Steam's shortcuts couldn't be read".into()))?,
+        _ => vec![],
+    };
+    for w in &a.plan.add {
+        let dir = Path::new(&w.exe).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let (art, icon) = arts.get(&w.id).cloned().unwrap_or_default();
+        let (next, app_id) = shortcuts::add_shortcut(Some(bytes.as_slice()), &w.name, &w.exe, &dir, &w.launch, &icon);
+        bytes = next;
+        shortcuts::save_art(&a.cfg, app_id, &art)?;
+    }
+    fs::create_dir_all(&a.cfg)?;
+    write_whole(&file, &bytes)?;
+    // Pictures of games that left, unless the same game comes back under the same id.
+    let staying: BTreeSet<u32> = a.apps.iter().copied().collect();
+    for o in a.plan.remove.iter().filter(|o| !staying.contains(&o.app_id)) {
+        shortcuts::remove_art(&a.cfg, o.app_id);
+    }
+    let removed: Vec<u32> = a.plan.remove.iter().map(|o| o.app_id).filter(|id| !staying.contains(id)).collect();
+    sync_collection(&a.cfg, &a.apps, &removed)?;
+    Ok(())
+}
+
+// ---------- which games ----------
+
+/// Ready to play from Steam: fully set up, by the same answer Play and the game's page give.
+/// Otherwise Steam would open the launcher to set it up, not the game, so it isn't added yet.
+fn ready(st: &App, recomp: &str, g: &Installed, game: Option<(&games::Game, &[games::Game])>) -> bool {
+    if g.exe.is_none() || !g.installer_setup.is_empty() {
+        return false;
+    }
+    // Its own setup program still to run, for any of the reasons Play would run it for (asked
+    // without using up the once-only ones, which are Play's to answer).
+    if crate::own_setup::pending(st, recomp, g).is_some() {
+        return false;
+    }
+    // A setup step that changed, a build that's gone, an update or files still to pick: not set
+    // up. A game built from a copy that's gone since plays without it: set up.
+    crate::plays_as_set_up(st, recomp, g, game)
+}
+
+/// The games that should be in Steam, and the ones installed but not ready yet (their entries
+/// stay as they are).
+async fn wants(st: &App) -> (Vec<Want>, BTreeSet<String>) {
+    let (list, aliases) = {
+        let l = st.lib.lock().unwrap();
+        (l.installed.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>(), l.project_aliases.clone())
+    };
+    let mut wants = vec![];
+    let mut keep = BTreeSet::new();
+    for (id, g) in list {
+        // A recomp with several games is a tile, and a Steam entry, per game.
+        let all = crate::games_of(st, &id, &g);
+        let tiles: Vec<(String, Option<&games::Game>)> = if all.is_empty() { vec![(id.clone(), None)] } else { all.iter().map(|x| (games::full(&id, &x.id), Some(x))).collect() };
+        for (tile, game) in tiles {
+            if !ready(st, &id, &g, game.map(|x| (x, all.as_slice()))) {
+                keep.insert(tile);
+                continue;
+            }
+            let name = crate::shown_name(st, &tile, &g).await;
+            let start = shortcuts::game_start(&st.dir, &tile);
+            wants.push(Want { id: tile, name, exe: start.exe.to_string_lossy().to_string(), launch: start.launch });        }
+    }
+    // An old id kept for shortcuts after a project match was corrected plays the game it now
+    // points to: kept while that game is.
+    for (old, new) in aliases {
+        if keep.contains(&new) {
+            keep.insert(old);
+        }
+    }
+    (wants, keep)
+}
+
+/// Linux from the AppImage: each game's launch script starts the AppImage where it is now (it may
+/// have moved since). Steam reads the script at Play, so this needs no restart.
+fn refresh_scripts(st: &App, wants: &[Want]) {
+    for w in wants {
+        let start = shortcuts::game_start(&st.dir, &w.id);
+        let Some(appimage) = start.appimage else { continue };
+        let _ = shortcuts::write_steam_script(&st.dir, &w.name, &w.id, &appimage);
+    }
+}
+
+fn accounts(steam: &Path, data: &Path, wants: &[Want], keep: &BTreeSet<String>) -> Vec<Account> {
+    shortcuts::steam_users(steam).iter().filter_map(|u| account(u, data, wants, keep)).collect()
+}
+
+fn behind(accts: &[Account]) -> bool {
+    accts.iter().any(|a| !a.plan.is_empty() || collection_behind(a))
+}
+
+// ---------- removing them all ----------
+
+/// One account's entries for Remove All to take out (only `plan.remove` is filled).
+fn removal(user: &Path, data: &Path, launcher: bool) -> Option<Account> {
+    let cfg = user.join("config");
+    let old = fs::read(cfg.join("shortcuts.vdf")).ok();
+    // Something in it the launcher can't read: the player's shortcuts are left alone.
+    let list = entries(old.as_deref())?;
+    let remove = all_of_ours(&list, &|exe| shortcuts::script_game(data, exe), launcher);
+    Some(Account { cfg, old, plan: Plan { add: vec![], remove }, apps: vec![] })
+}
+
+fn removals(steam: &Path, data: &Path, launcher: bool) -> Vec<Account> {
+    shortcuts::steam_users(steam).iter().filter_map(|u| removal(u, data, launcher)).collect()
+}
+
+/// How many of the launcher's games are in Steam (each counted once, whatever the accounts), and
+/// whether its own entry is.
+fn ours_in(accts: &[Account]) -> (usize, bool) {
+    let all: Vec<&Owned> = accts.iter().flat_map(|a| a.plan.remove.iter()).collect();
+    let games: BTreeSet<&str> = all.iter().map(|o| o.id.as_str()).filter(|id| !id.is_empty()).collect();
+    let launcher = all.iter().any(|o| o.id.is_empty());
+    (games.len(), launcher)
+}
+
+/// Take one account's entries out, with their art, and out of the collection.
+fn take_out(a: &Account) -> Result<(), Error> {
+    let unreadable = || Error::Msg("Steam's shortcuts couldn't be read".into());
+    let old = a.old.as_deref().filter(|o| !o.is_empty()).ok_or_else(unreadable)?;
+    shortcuts::keep_backup(&a.cfg, old);
+    let keys: BTreeSet<String> = a.plan.remove.iter().map(|o| o.key.clone()).collect();
+    let bytes = without(old, &keys).ok_or_else(unreadable)?;
+    write_whole(&a.cfg.join("shortcuts.vdf"), &bytes)?;
+    for o in &a.plan.remove {
+        shortcuts::remove_art(&a.cfg, o.app_id);
+    }
+    let ids: Vec<u32> = a.plan.remove.iter().map(|o| o.app_id).collect();
+    write_collections(&a.cfg, |old| collection_without(old, &ids, crate::library::now()))?;
+    Ok(())
+}
+
+/// Settings → Steam → Remove All. Same Steam-is-open answer as a sync ("steam_running" until
+/// `restart`). Keep Steam in Sync turns off as they go, or the next sync would put them all back.
+/// "none" when Steam has none of them, "removed:<games>:<launcher 0 or 1>" after.
+async fn remove_all(st: &App, restart: bool, launcher: bool) -> Res<String> {
+    let steam = shortcuts::steam_dir().ok_or_else(|| Error::Msg("Steam isn't installed on this PC.".into()))?;
+    let Some(_busy) = Busy::take() else { return Ok("busy".into()) };
+    let (games, has_launcher) = ours_in(&removals(&steam, &st.dir, launcher));
+    if games == 0 && !has_launcher {
+        return Ok("none".into());
+    }
+    let was_running = shortcuts::steam_running();
+    if was_running && !restart {
+        return Ok("steam_running".into());
+    }
+    if was_running {
+        if let Some(why) = shortcuts::cant_restart_steam() {
+            return Err(Error::Msg(why.into()));
+        }
+        trail::note("Steam remove all: closing Steam");
+        shortcuts::close_steam(&steam).await.inspect_err(|e| trail::note(format!("Steam remove all: {e}")))?;
+    }
+    st.lib.lock().unwrap().settings.steam_sync = false;
+    st.save();
+    // Read again now Steam is closed: it writes its list back as it closes.
+    let accts = removals(&steam, &st.dir, launcher);
+    let (games, has_launcher) = ours_in(&accts);
+    let mut done = 0;
+    let mut failed = None;
+    for a in accts.iter().filter(|a| !a.plan.remove.is_empty()) {
+        match take_out(a) {
+            Ok(()) => done += 1,
+            Err(e) => failed = Some(e),
+        }
+    }
+    if was_running {
+        shortcuts::start_steam(&steam);
+    }
+    if let Some(e) = failed {
+        trail::note(format!("Steam remove all: {e}"));
+        if done == 0 {
+            return Err(e);
+        }
+    }
+    trail::note(format!("Steam remove all: {games} game(s), launcher entry {has_launcher}, from {done} account(s)"));
+    Ok(format!("removed:{games}:{}", u8::from(has_launcher)))
+}
+
+// ---------- syncing ----------
+
+/// One sync at a time: the timer and Sync Now could otherwise both write.
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+struct Busy;
+impl Busy {
+    fn take() -> Option<Busy> {
+        BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).ok().map(|_| Busy)
+    }
+}
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// Bring Steam in line. With Steam open and `restart` false nothing is written and the answer is
+/// "steam_running", so the window can ask first; with `restart`, Steam is closed, written to and
+/// opened again. "in_sync" when nothing had to change, "synced:<added>:<removed>" after writing.
+async fn sync(st: &App, restart: bool) -> Res<String> {
+    let steam = shortcuts::steam_dir().ok_or_else(|| Error::Msg("Steam isn't installed on this PC.".into()))?;
+    let Some(_busy) = Busy::take() else { return Ok("busy".into()) };
+    let (wants, keep) = wants(st).await;
+    refresh_scripts(st, &wants);
+    if !behind(&accounts(&steam, &st.dir, &wants, &keep)) {
+        return Ok("in_sync".into());
+    }
+    let was_running = shortcuts::steam_running();
+    if was_running && !restart {
+        return Ok("steam_running".into());
+    }
+    if was_running {
+        if let Some(why) = shortcuts::cant_restart_steam() {
+            return Err(Error::Msg(why.into()));
+        }
+        trail::note("Steam sync: closing Steam");
+        shortcuts::close_steam(&steam).await.inspect_err(|e| trail::note(format!("Steam sync: {e}")))?;
+    }
+    // Read again now Steam is closed: it writes its list back as it closes.
+    let accts = accounts(&steam, &st.dir, &wants, &keep);
+    let coming: BTreeSet<String> = accts.iter().flat_map(|a| a.plan.add.iter().map(|w| w.id.clone())).collect();
+    let mut arts = Arts::new();
+    for id in coming {
+        let Ok(g) = crate::installed_or_game(st, &id) else { continue };
+        arts.insert(id.clone(), crate::steam_art(st, &id, &g).await);
+    }
+    let (mut added, mut removed) = (0, 0);
+    let mut failed = None;
+    for a in &accts {
+        if !a.plan.is_empty() || collection_behind(a) {
+            match apply(a, &arts) {
+                Ok(()) => {
+                    added += a.plan.add.len();
+                    removed += a.plan.remove.len();
+                }
+                Err(e) => failed = Some(e),
+            }
+        }
+    }
+    if was_running {
+        shortcuts::start_steam(&steam);
+    }
+    if let Some(e) = failed {
+        trail::note(format!("Steam sync: {e}"));
+        if added + removed == 0 {
+            return Err(e);
+        }
+    }
+    trail::note(format!("Steam sync: {added} added, {removed} removed, for {} account(s)", accts.len()));
+    Ok(format!("synced:{added}:{removed}"))
+}
+
+// ---------- Add to Steam ----------
+
+/// Add to Steam for one game puts in the same entry the sync would, and replaces any other entry
+/// of the launcher's for that game (an older way of starting it, an older name).
+pub fn plan_one(owned: &[Owned], want: &Want) -> Plan {
+    let remove = owned.iter().filter(|o| o.id == want.id).cloned().collect();
+    Plan { add: vec![want.clone()], remove }
+}
+
+/// The entry Add to Steam and the sync both write for a game. On Linux from the AppImage its
+/// launch script is (re)written here too.
+pub fn want_for(data: &Path, id: &str, name: &str) -> Want {
+    let start = shortcuts::game_start(data, id);
+    if let Some(appimage) = &start.appimage {
+        let _ = shortcuts::write_steam_script(data, name, id, appimage);
+    }
+    Want { id: id.to_string(), name: name.to_string(), exe: start.exe.to_string_lossy().to_string(), launch: start.launch }
+}
+
+/// Add to Steam (Steam already closed): written through the sync's own steps, so the game lands in
+/// the RecompLauncher collection, turning Keep Steam in Sync on later finds it already there (no
+/// second entry), and the sync takes it out again once it's uninstalled. The accounts written for.
+pub async fn add_game(steam: &Path, data: &Path, want: &Want, art: Vec<(&'static str, Vec<u8>, &'static str)>, icon: String) -> Result<usize, Error> {
+    let users = shortcuts::steam_users(steam);
+    if users.is_empty() {
+        return Err(Error::Msg("Sign in to Steam once on this PC first.".into()));
+    }
+    // The sync's timer may be writing right now: wait for it rather than write over each other.
+    let mut busy = Busy::take();
+    for _ in 0..60 {
+        if busy.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        busy = Busy::take();
+    }
+    let Some(_busy) = busy else { return Err(Error::Msg("Steam is being synced right now. Try again in a minute.".into())) };
+    let accts: Vec<Account> = users.iter().filter_map(|u| account_with(u, data, &|mine| plan_one(mine, want))).collect();
+    if accts.is_empty() {
+        return Err(Error::Msg("Steam's list of non-Steam games has something in it the launcher can't read, so it left it as it is. Add the game from Steam instead: Add a Game, then Add a Non-Steam Game.".into()));
+    }
+    let arts = Arts::from([(want.id.clone(), (art, icon))]);
+    for a in &accts {
+        apply(a, &arts)?;
+    }
+    Ok(accts.len())
+}
+
+/// The pictures of the launcher's games already in Steam, written again: Show Game Names changed
+/// which set recomps show. Only the grid folder is written, never shortcuts.vdf, so Steam can stay
+/// open (it shows them once it reads its pictures again). How many entries got them.
+pub async fn refresh_art(st: &App) -> usize {
+    let Some(steam) = shortcuts::steam_dir() else { return 0 };
+    // The sync's timer may be writing pictures right now: wait for it rather than write over each other.
+    let mut busy = Busy::take();
+    for _ in 0..60 {
+        if busy.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        busy = Busy::take();
+    }
+    let Some(_busy) = busy else { return 0 };
+    let mut arts = Arts::new();
+    let mut n = 0;
+    for user in shortcuts::steam_users(&steam) {
+        let cfg = user.join("config");
+        let Some(list) = entries(fs::read(cfg.join("shortcuts.vdf")).ok().as_deref()) else { continue };
+        for o in owned(&list, &|exe| shortcuts::script_game(&st.dir, exe)) {
+            let Ok(g) = crate::installed_or_game(st, &o.id) else { continue };
+            if !arts.contains_key(&o.id) {
+                let art = crate::steam_art(st, &o.id, &g).await;
+                arts.insert(o.id.clone(), art);
+            }
+            let (art, _) = &arts[&o.id];
+            if shortcuts::save_art(&cfg, o.app_id, art).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Settings → Keep Steam in Sync → Sync Now (and turning it on).
+#[tauri::command]
+pub async fn steam_sync_now(st: State<'_, App>, restart: bool) -> Res<String> {
+    sync(&st, restart).await
+}
+
+/// For the settings' lines: how many games are waiting to go in or out of Steam, and how many of
+/// the launcher's are in it.
+#[tauri::command]
+pub async fn steam_sync_state(st: State<'_, App>) -> Res<Value> {
+    let Some(steam) = shortcuts::steam_dir() else { return Ok(json!({ "steam": false })) };
+    let (wants, keep) = wants(&st).await;
+    let accts = accounts(&steam, &st.dir, &wants, &keep);
+    let add: BTreeSet<String> = accts.iter().flat_map(|a| a.plan.add.iter().map(|w| w.id.clone())).collect();
+    let remove: BTreeSet<String> = accts.iter().flat_map(|a| a.plan.remove.iter().map(|o| o.key.clone() + &o.id)).collect();
+    // For Remove All's line, whether the setting is on or not.
+    let (ours, launcher) = ours_in(&removals(&steam, &st.dir, true));
+    Ok(json!({ "steam": true, "games": wants.len(), "add": add.len(), "remove": remove.len(), "collection": accts.iter().any(collection_behind), "running": shortcuts::steam_running(), "ours": ours, "launcher": launcher }))
+}
+
+/// Settings → Steam → Remove All: every game the launcher put in Steam, and with `launcher` its
+/// own entry too.
+#[tauri::command]
+pub async fn steam_remove_all(st: State<'_, App>, restart: bool, launcher: bool) -> Res<String> {
+    remove_all(&st, restart, launcher).await
+}
+
+/// While the setting is on: write what changed whenever Steam is found closed.
+pub fn start(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        // The same problem every two minutes goes in the log once.
+        let mut told = String::new();
+        loop {
+            let st = app.state::<App>();
+            let on = st.lib.lock().unwrap().settings.steam_sync;
+            if on && shortcuts::steam_dir().is_some() && !shortcuts::steam_running() {
+                let why = sync(&st, false).await.err().map(|e| e.to_string()).unwrap_or_default();
+                if !why.is_empty() && why != told {
+                    trail::note(format!("Steam sync: {why}"));
+                }
+                told = why;
+            }
+            tokio::time::sleep(CHECK_EVERY).await;
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn want(id: &str, name: &str) -> Want {
+        Want { id: id.into(), name: name.into(), exe: r"C:\RL\recomplauncher.exe".into(), launch: format!("--play {id}") }
+    }
+
+    fn file_with(wants: &[Want]) -> Vec<u8> {
+        let mut bytes = vec![];
+        for w in wants {
+            bytes = shortcuts::add_shortcut(Some(bytes.as_slice()), &w.name, &w.exe, r"C:\RL", &w.launch, "").0;
+        }
+        bytes
+    }
+
+    fn owned_in(bytes: &[u8]) -> Vec<Owned> {
+        owned(&entries(Some(bytes)).unwrap(), &|_| None)
+    }
+
+    #[test]
+    fn reads_the_game_a_launch_option_plays() {
+        assert_eq!(played_id("--play some-recomp").as_deref(), Some("some-recomp"));
+        assert_eq!(played_id("'run' 'io.github.RecompLauncher' --play cogbox--gow2").as_deref(), Some("cogbox--gow2"));
+        assert_eq!(played_id("--bigpicture"), None);
+    }
+
+    #[test]
+    fn the_launchers_own_entry_and_other_programs_are_not_its_games() {
+        let other = vec![("0".to_string(), Node::Map(vec![("AppName".into(), Node::Str("Dolphin".into())), ("Exe".into(), Node::Str("\"dolphin.exe\"".into())), ("LaunchOptions".into(), Node::Str("--play x".into()))]))];
+        let mut bytes = shortcuts::write_vdf(&[("shortcuts".to_string(), Node::Map(other))]);
+        bytes = shortcuts::add_shortcut(Some(bytes.as_slice()), "RecompLauncher", r"C:\RL\recomplauncher.exe", r"C:\RL", "--bigpicture", "").0;
+        assert!(owned_in(&bytes).is_empty());
+    }
+
+    #[test]
+    fn a_ready_game_missing_from_steam_is_added() {
+        let p = plan(&[], &[want("banjo", "Banjo")], &BTreeSet::new());
+        assert_eq!(p.add.len(), 1);
+        assert!(p.remove.is_empty());
+    }
+
+    #[test]
+    fn a_game_already_in_steam_the_same_way_is_left_alone() {
+        let w = want("banjo", "Banjo");
+        let bytes = file_with(std::slice::from_ref(&w));
+        assert!(plan(&owned_in(&bytes), &[w], &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn an_uninstalled_games_entry_is_removed() {
+        let bytes = file_with(&[want("banjo", "Banjo")]);
+        let p = plan(&owned_in(&bytes), &[], &BTreeSet::new());
+        assert_eq!(p.remove.len(), 1);
+        assert_eq!(p.remove[0].id, "banjo");
+    }
+
+    #[test]
+    fn a_game_not_ready_yet_keeps_its_entry() {
+        let bytes = file_with(&[want("banjo", "Banjo")]);
+        let keep = BTreeSet::from(["banjo".to_string()]);
+        assert!(plan(&owned_in(&bytes), &[], &keep).is_empty());
+    }
+
+    #[test]
+    fn a_renamed_game_is_replaced() {
+        let bytes = file_with(&[want("banjo", "Banjo")]);
+        let p = plan(&owned_in(&bytes), &[want("banjo", "Banjo-Kazooie")], &BTreeSet::new());
+        assert_eq!(p.add[0].name, "Banjo-Kazooie");
+        assert_eq!(p.remove[0].name, "Banjo");
+    }
+
+    #[test]
+    fn add_to_steam_replaces_the_games_older_entry() {
+        let bytes = file_with(&[want("banjo", "Banjo"), want("zelda", "Zelda")]);
+        let p = plan_one(&owned_in(&bytes), &want("banjo", "Banjo-Kazooie"));
+        assert_eq!(p.add[0].name, "Banjo-Kazooie");
+        assert_eq!(p.remove.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["Banjo"]);
+    }
+
+    #[test]
+    fn a_game_added_to_steam_by_hand_is_not_added_again_by_the_sync() {
+        let w = want("banjo", "Banjo");
+        let bytes = file_with(&[w.clone()]);
+        let mine = owned_in(&bytes);
+        let p = plan_one(&mine, &w);
+        let keys: BTreeSet<String> = p.remove.iter().map(|o| o.key.clone()).collect();
+        let (after, _) = shortcuts::add_shortcut(Some(&without(&bytes, &keys).unwrap()), &w.name, &w.exe, r"C:\RL", &w.launch, "");
+        assert_eq!(owned_in(&after).len(), 1);
+        assert!(plan(&owned_in(&after), &[w], &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn removing_keeps_other_entries_numbered_from_zero() {
+        let bytes = file_with(&[want("a", "A"), want("b", "B"), want("c", "C")]);
+        let out = without(&bytes, &BTreeSet::from(["1".to_string()])).unwrap();
+        let list = entries(Some(out.as_slice())).unwrap();
+        let names: Vec<(&str, &str)> = list.iter().map(|(k, e)| (k.as_str(), e.str("AppName"))).collect();
+        assert_eq!(names, vec![("0", "A"), ("1", "C")]);
+    }
+
+    #[test]
+    fn a_new_collection_goes_in_at_the_newest_version() {
+        let file = r#"[["user-collections.favorite",{"key":"user-collections.favorite","timestamp":1,"value":"{\"id\":\"favorite\",\"name\":\"Favorites\",\"added\":[],\"removed\":[]}","version":"5085"}]]"#;
+        let (out, key) = with_collection(file, &[3890861067], &[], 99).unwrap();
+        assert_eq!(key, "user-collections.rl-recomplauncher");
+        let list: Vec<Value> = serde_json::from_str(&out).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1][1]["version"], "5085");
+        let value: Value = serde_json::from_str(list[1][1]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(value, json!({ "id": "rl-recomplauncher", "name": "RecompLauncher", "added": [3890861067u32], "removed": [] }));
+    }
+
+    #[test]
+    fn the_collection_keeps_games_the_player_put_in_it() {
+        let value = json!({ "id": "rl-recomplauncher", "name": "RecompLauncher", "added": [5, 7], "removed": [] }).to_string();
+        let file = json!([["user-collections.rl-recomplauncher", { "key": "user-collections.rl-recomplauncher", "timestamp": 1, "value": value, "version": "10" }]]).to_string();
+        let (out, _) = with_collection(&file, &[9], &[7], 2).unwrap();
+        let list: Vec<Value> = serde_json::from_str(&out).unwrap();
+        let value: Value = serde_json::from_str(list[0][1]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(value["added"], json!([5, 9]));
+    }
+
+    #[test]
+    fn an_up_to_date_collection_is_not_written() {
+        let value = json!({ "id": "rl-recomplauncher", "name": "RecompLauncher", "added": [5], "removed": [] }).to_string();
+        let file = json!([["user-collections.rl-recomplauncher", { "key": "user-collections.rl-recomplauncher", "timestamp": 1, "value": value, "version": "10" }]]).to_string();
+        assert_eq!(with_collection(&file, &[5], &[], 2), None);
+    }
+
+    #[test]
+    fn a_collection_the_player_named_recomplauncher_is_used() {
+        let value = json!({ "id": "uc-abc", "name": "RecompLauncher", "added": [], "removed": [] }).to_string();
+        let file = json!([["user-collections.uc-abc", { "key": "user-collections.uc-abc", "timestamp": 1, "value": value, "version": "10" }]]).to_string();
+        let (out, key) = with_collection(&file, &[5], &[], 2).unwrap();
+        assert_eq!(key, "user-collections.uc-abc");
+        assert_eq!(serde_json::from_str::<Vec<Value>>(&out).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_collections_file_is_backed_up_once_before_the_first_write() {
+        let d = std::env::temp_dir().join(format!("rl-steam-backup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        keep_collections_backup(&d, "the player's own");
+        keep_collections_backup(&d, "after the launcher wrote");
+        assert_eq!(fs::read_to_string(d.join("cloud-storage-namespace-1.json.recomplauncher-backup")).unwrap(), "the player's own");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_changed_collection_is_marked_for_upload_once() {
+        let once = with_modified("[]", "user-collections.rl-recomplauncher").unwrap();
+        assert_eq!(once, r#"["user-collections.rl-recomplauncher"]"#);
+        assert_eq!(with_modified(&once, "user-collections.rl-recomplauncher"), None);
+    }
+
+    fn with_launcher_entry(bytes: &[u8]) -> Vec<u8> {
+        shortcuts::add_shortcut(Some(bytes), "RecompLauncher", r"C:\RL\recomplauncher.exe", r"C:\RL", "--bigpicture", "").0
+    }
+
+    fn collection_file(added: &[u32]) -> String {
+        let value = json!({ "id": "rl-recomplauncher", "name": "RecompLauncher", "added": added, "removed": [] }).to_string();
+        json!([["user-collections.rl-recomplauncher", { "key": "user-collections.rl-recomplauncher", "timestamp": 1, "value": value, "version": "10" }]]).to_string()
+    }
+
+    #[test]
+    fn remove_all_takes_every_game_but_not_the_launcher_by_default() {
+        let bytes = with_launcher_entry(&file_with(&[want("a", "A"), want("b", "B")]));
+        let ours = all_of_ours(&entries(Some(bytes.as_slice())).unwrap(), &|_| None, false);
+        let ids: Vec<&str> = ours.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn remove_all_can_take_the_launchers_own_entry_too() {
+        let bytes = with_launcher_entry(&file_with(&[want("a", "A")]));
+        let ours = all_of_ours(&entries(Some(bytes.as_slice())).unwrap(), &|_| None, true);
+        assert_eq!(ours.len(), 2);
+        assert_eq!(ours[1].name, "RecompLauncher");
+        assert!(ours[1].id.is_empty());
+    }
+
+    #[test]
+    fn remove_all_leaves_the_players_own_programs() {
+        let other = vec![("0".to_string(), Node::Map(vec![("AppName".into(), Node::Str("Dolphin".into())), ("Exe".into(), Node::Str("\"dolphin.exe\"".into())), ("LaunchOptions".into(), Node::Str("--bigpicture".into()))]))];
+        let bytes = shortcuts::write_vdf(&[("shortcuts".to_string(), Node::Map(other))]);
+        assert!(all_of_ours(&entries(Some(bytes.as_slice())).unwrap(), &|_| None, true).is_empty());
+    }
+
+    #[test]
+    fn games_are_counted_once_across_accounts() {
+        let a = Owned { key: "0".into(), id: "banjo".into(), app_id: 1, name: "Banjo".into(), exe: String::new(), launch: String::new() };
+        let launcher = Owned { id: String::new(), ..a.clone() };
+        let acct = |remove: Vec<Owned>| Account { cfg: PathBuf::new(), old: None, plan: Plan { add: vec![], remove }, apps: vec![] };
+        assert_eq!(ours_in(&[acct(vec![a.clone()]), acct(vec![a, launcher])]), (1, true));
+    }
+
+    #[test]
+    fn an_emptied_collection_is_deleted() {
+        let (out, key) = collection_without(&collection_file(&[5, 7]), &[5, 7], 99).unwrap();
+        assert_eq!(key, "user-collections.rl-recomplauncher");
+        let list: Vec<Value> = serde_json::from_str(&out).unwrap();
+        assert_eq!(list[0][1], json!({ "key": key, "timestamp": 99, "is_deleted": true, "version": "10" }));
+    }
+
+    #[test]
+    fn a_collection_with_the_players_games_stays() {
+        let (out, _) = collection_without(&collection_file(&[5, 7]), &[5], 99).unwrap();
+        let list: Vec<Value> = serde_json::from_str(&out).unwrap();
+        let value: Value = serde_json::from_str(list[0][1]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(value["added"], json!([7]));
+    }
+
+    #[test]
+    fn no_collection_is_made_just_to_be_emptied() {
+        assert_eq!(collection_without("[]", &[5], 99), None);
+    }
+
+    #[test]
+    fn an_already_deleted_collection_is_left_alone() {
+        let file = json!([["user-collections.rl-recomplauncher", { "key": "user-collections.rl-recomplauncher", "timestamp": 1, "is_deleted": true, "version": "10" }]]).to_string();
+        assert_eq!(collection_without(&file, &[5], 99), None);
+    }
+}

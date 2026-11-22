@@ -1,0 +1,9 @@
+:root { color-scheme:dark; font:18px/1.6 system-ui,sans-serif; background:#0c1424; color:#e9eeff; }
+body { margin:0; padding:clamp(24px,5vw,72px); }
+main { max-width:850px; margin:auto; }
+h1 { font-size:clamp(28px,4vw,44px); line-height:1.2; }
+#status { border:1px solid #6c88c7; border-radius:14px; background:#192944; padding:18px 24px; }
+#status[data-state=ready] { border-color:#67c7a0; }
+#status[data-state=unsupported], #status[data-state=error] { border-color:#e6bb70; }
+li { margin-block:10px; }
+strong { color:#bdceff; }

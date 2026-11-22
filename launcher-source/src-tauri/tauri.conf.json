@@ -1,0 +1,88 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RecompLauncher",
+  "version": "0.90.0-beta.68",
+  "identifier": "com.recomplauncher.app",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "RecompLauncher",
+        "width": 1360,
+        "height": 860,
+        "minWidth": 560,
+        "minHeight": 400,
+        "decorations": false,
+        "center": true,
+        "backgroundColor": "#0B1220",
+        "label": "main",
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' https: data: blob: asset: http://asset.localhost rlimg: http://rlimg.localhost rlplug: http://rlplug.localhost http://127.0.0.1:*; frame-src rlplug: http://rlplug.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'; media-src 'self'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://tauri.localhost tauri://localhost",
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$PICTURE/RecompLauncher/**",
+          "$APPDATA/covers/**"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis",
+      "appimage",
+      "deb"
+    ],
+    "publisher": "Ripalda",
+    "homepage": "https://recomplauncher.com",
+    "category": "Game",
+    "shortDescription": "Recompiled and decompiled PC games",
+    "longDescription": "RecompLauncher finds, installs, updates and starts recompiled and decompiled PC games, straight from each developer's own GitHub. No game files are included: every game needs your own copy.",
+    "copyright": "RecompLauncher is free software under the GPL-3.0. No game content is included.",
+    "license": "GPL-3.0-or-later",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false,
+        "headerImage": "installer/header.bmp",
+        "sidebarImage": "installer/sidebar.bmp",
+        "installerIcon": "icons/icon.ico"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0"
+        ],
+        "desktopTemplate": "linux/recomplauncher.desktop"
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "recomplauncher"
+        ]
+      }
+    }
+  }
+}

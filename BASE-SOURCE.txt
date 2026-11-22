@@ -1,0 +1,3 @@
+https://github.com/elripalda/RecompLauncher
+Base commit: 95ca2128b3088c634e771232a9ef8d911cfa9d87
+Custom changes: ROM Auto Extract, permission rom.unpack.

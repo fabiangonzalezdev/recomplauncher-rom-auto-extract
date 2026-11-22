@@ -1,0 +1,4446 @@
+//! Launcher profiles: what RecompLauncher needs to know to set a recomp up and change its settings
+//! without the recomp's own launcher. Where the player's copy of the game goes, which program to
+//! start and how, where its settings file is, and which settings to offer.
+//!
+//! A developer ships one as `recomplauncher.json` in their release (it lands in the game's folder),
+//! or the catalog carries it (`"launcher": {...}`), or one is built in here (none right now; docs/examples has two).
+//! docs/DEVELOPERS.md describes the format.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use crate::nup;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Profile {
+    /// Named disc/DLC inputs and explicit key dependencies. See docs/SETUP-INPUTS.md.
+    #[serde(default)]
+    pub inputs: Vec<crate::inputs::Input>,
+    #[serde(skip)]
+    pub input_paths: BTreeMap<String, PathBuf>,
+    /// Optional inputs this launcher skipped (a shared type or role it doesn't know, or DLSS on a PC
+    /// it doesn't apply to), and the other games' inputs when one game of several is played: their
+    /// {input:...} arguments are left out instead of failing.
+    #[serde(skip)]
+    pub skipped_inputs: Vec<String>,
+    /// The installed build's platform preference, supplied by the launcher, never a manifest.
+    #[serde(skip)]
+    pub windows_build: Option<bool>,
+    #[serde(default)]
+    pub format: u32,
+    /// GitHub repo this built-in profile is for.
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub game: Option<GameCopy>,
+    #[serde(default)]
+    pub start: Option<Start>,
+    #[serde(default)]
+    pub config: Vec<Config>,
+    #[serde(default)]
+    pub folders: BTreeMap<String, Vec<Place>>,
+    /// Exit codes and what they mean, said to the player.
+    #[serde(default)]
+    pub exit_codes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub settings: Vec<Setting>,
+    /// Groups of settings, next to "settings": a whole group can be advanced (hidden until the
+    /// player shows advanced options).
+    #[serde(default)]
+    pub groups: Vec<Group>,
+    #[serde(default)]
+    pub actions: Vec<Action>,
+    /// The recomp's own setup step, run once after the player's copy is picked (and again when
+    /// it changes): pulls what the game needs from the disc, builds caches.
+    #[serde(default)]
+    pub prepare: Option<Prepare>,
+    /// Whether looks (ReShade filters) can be used with it, and how.
+    #[serde(default)]
+    pub looks: Option<crate::looks::ProfileLooks>,
+    /// What it needs from the PC, by system (sysneeds.rs). Left out of the profile when it isn't
+    /// given, so setups fingerprinted before it existed stay as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<crate::sysneeds::SystemNeeds>,
+    /// Where the game keeps its saves: folders, files, or `*` patterns, with the same {local},
+    /// {documents}, {install}... as everywhere else. Backups and cloud saves copy these.
+    #[serde(default)]
+    pub saves: Vec<String>,
+    /// The games a recomp that carries several lists (see games.rs), as written: read with
+    /// games::of, which leaves out what doesn't fit instead of failing the whole file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub games: Option<Value>,
+    /// Made by the launcher from the catalog's boot profile, not by the game's developer: the
+    /// release's own setup still runs first, and its settings only change files that are there.
+    #[serde(skip)]
+    pub from_boot: bool,
+    /// The player's slider values for settings on the command line (setting id -> value), from
+    /// the Library: filled in by the launcher, never read from the file.
+    #[serde(skip)]
+    pub slider_vals: BTreeMap<String, String>,
+}
+
+/// A program in the release that sets the game up without showing a window. It may print lines
+/// like `progress 0.4 Unpacking menu art` while it works, and exits 0 when it's done.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Prepare {
+    pub program: Vec<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// What the setup screen calls this step.
+    #[serde(default)]
+    pub label: String,
+    /// Ticks on the setup screen before the step runs, each adding its arguments when it's on
+    /// (a library the builder downloads under a company's license, say).
+    #[serde(default, deserialize_with = "options_lenient", skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<PrepareOption>,
+    /// Not part of the SDK anymore: every new release builds again by itself. Read only to tell,
+    /// once, whether a setup from before format 3 was current (lib.rs, old_setup).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    /// Files the step leaves when it has finished ({home}, {local}, {install}...). All there: the
+    /// game is set up, even when another launcher built it.
+    #[serde(default, deserialize_with = "paths_lenient", skip_serializing_if = "Vec::is_empty")]
+    pub done: Vec<String>,
+    /// Environment variables for the step, as `start.env`. Left out of the profile when there are
+    /// none, so setups fingerprinted before it existed stay as they were.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// The step keeps what it needs from the copy in the game's build folder (folders.game), and
+    /// runs again from there without the copy: then the arguments with {game} are left out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keeps_copy: bool,
+}
+
+/// A path or a list of them; anything else is nothing.
+fn paths_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(match v {
+        Value::String(s) if !s.trim().is_empty() => vec![s],
+        Value::Array(l) => l.into_iter().filter_map(|x| x.as_str().map(str::to_string)).filter(|x| !x.trim().is_empty()).collect(),
+        _ => vec![],
+    })
+}
+
+/// prepare.options as written, each one that can be read: one with a value of the wrong type is
+/// left out (the developer check names it), never the whole file, so the game still sets up.
+fn options_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<PrepareOption>, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(v.as_array().map(|l| l.iter().filter_map(|o| serde_json::from_value::<PrepareOption>(o.clone()).ok()).collect()).unwrap_or_default())
+}
+
+/// One tick for the setup step.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct PrepareOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub note: String,
+    /// Added after the step's own arguments when the tick is on.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Shown only on these systems ("windows", "linux", "macos"); every one when empty.
+    #[serde(default)]
+    pub os: Vec<String>,
+    /// Shown only with this brand of graphics card: "nvidia" (an RTX card, as DLSS needs) or "amd".
+    #[serde(default)]
+    pub gpu: String,
+    /// What the player accepts by ticking it. With one, the tick starts off.
+    #[serde(default)]
+    pub license: Option<OptionLicense>,
+    /// Whether it starts ticked (on when not given). Ignored with a license.
+    #[serde(default, rename = "default")]
+    pub start_on: Option<bool>,
+    /// Setup can't run until it's ticked (a license the build can't do without). It still starts
+    /// off with a license: only the player accepts one.
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct OptionLicense {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+impl PrepareOption {
+    /// Whether it's offered on this PC: its system, and its brand of graphics card.
+    pub fn applies(&self, os: &str, nvidia_rtx: bool, amd: bool) -> bool {
+        (self.os.is_empty() || self.os.iter().any(|o| o.eq_ignore_ascii_case(os)))
+            && match self.gpu.to_ascii_lowercase().as_str() {
+                "" => true,
+                "nvidia" => nvidia_rtx,
+                "amd" => amd,
+                _ => false,
+            }
+    }
+    /// As the player set it; else on (or as its "default" says), and off with a license.
+    pub fn on(&self, picked: &BTreeMap<String, bool>) -> bool {
+        picked.get(&self.id).copied().unwrap_or(self.license.is_none() && self.start_on.unwrap_or(true))
+    }
+}
+
+impl Prepare {
+    /// The options this PC is offered.
+    pub fn options_here(&self, os: &str, nvidia_rtx: bool, amd: bool) -> Vec<&PrepareOption> {
+        self.options.iter().filter(|o| !o.id.is_empty() && !o.label.is_empty() && o.applies(os, nvidia_rtx, amd)).collect()
+    }
+    /// The options this PC is offered that the player hasn't answered yet (none kept for them).
+    pub fn unanswered(&self, os: &str, nvidia_rtx: bool, amd: bool, picked: &BTreeMap<String, bool>) -> Vec<&PrepareOption> {
+        self.options_here(os, nvidia_rtx, amd).into_iter().filter(|o| !picked.contains_key(&o.id)).collect()
+    }
+    /// The arguments the ticked options add, in their order.
+    pub fn option_args(&self, os: &str, nvidia_rtx: bool, amd: bool, picked: &BTreeMap<String, bool>) -> Vec<String> {
+        self.options_here(os, nvidia_rtx, amd).into_iter().filter(|o| o.on(picked)).flat_map(|o| o.args.iter().cloned()).collect()
+    }
+    /// The required options this PC is offered that aren't ticked: setup waits for them.
+    pub fn unticked_required(&self, os: &str, nvidia_rtx: bool, amd: bool, picked: &BTreeMap<String, bool>) -> Vec<&PrepareOption> {
+        self.options_here(os, nvidia_rtx, amd).into_iter().filter(|o| o.required && !o.on(picked)).collect()
+    }
+}
+
+impl Prepare {
+    /// `prepare.env`, filled in; names that aren't allowed are left out, and so is a value with a
+    /// named input still in it (`with_inputs` fills those in first: an optional DLC the player
+    /// didn't give is left out, as in `prepare.args`).
+    pub fn env_vars(&self, install: &Path, copy: Option<&Path>) -> Vec<(String, String)> {
+        let mut out = vec![];
+        for (k, v) in self.env.iter().filter(|(k, _)| env_name_ok(k)) {
+            // Run again without the copy (keeps_copy): a value naming it is left out, as in args.
+            if copy.is_none() && v.contains("{game}") {
+                continue;
+            }
+            let value = fill(v, install, copy);
+            if value.contains("{input:") {
+                continue;
+            }
+            out.push((k.clone(), value));
+        }
+        out
+    }
+
+    /// The step with the player's named inputs in its arguments and environment.
+    /// `wine`: a Windows step run through Proton or Wine on Linux, given the paths as it reads them.
+    pub fn with_inputs(&self, inputs: &BTreeMap<String, PathBuf>, wine: bool) -> Prepare {
+        let mut pr = self.clone();
+        // Omit an argument containing an absent optional/conditional token. Put flags in the same
+        // argument (e.g. --dlc={input:dlc}) so a flag cannot steal the next value.
+        pr.args = crate::inputs::arguments(&self.args, inputs, wine);
+        pr.env = self.env.iter().map(|(k, v)| (k.clone(), crate::inputs::expand(v, inputs, wine))).collect();
+        pr
+    }
+
+    /// Whether it's a Windows program that runs through Proton or Wine here (on Linux), as the
+    /// game's own Windows build does.
+    pub fn through_proton(&self, install: &Path) -> bool {
+        !cfg!(windows) && self.program_in(install).is_some_and(|e| crate::proton::is_windows_program(&e))
+    }
+
+    /// Its program in the game's folder: a name it gives, or on Linux and Mac the native build by
+    /// the same name (a release's Game-nightly-4-x86_64.AppImage for "Game.AppImage"), as Play
+    /// finds the game's own program.
+    pub fn program_in(&self, install: &Path) -> Option<PathBuf> {
+        let named = self.program.iter().find_map(|p| named_program(install.join(p)));
+        if named.is_some() || cfg!(windows) {
+            return named;
+        }
+        self.program.iter().find_map(|p| native_twin(install, p))
+    }
+}
+
+/// A known good dump of the disc (from Redump), to check the player's copy against.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Dump {
+    /// Said when it matches ("USA", "Europe").
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+    /// CRC32 of the whole image, hex.
+    pub crc32: String,
+}
+
+/// The player's own copy of the game.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GameCopy {
+    /// "iso", "folder" or "iso_or_folder".
+    #[serde(default = "iso")]
+    pub kind: String,
+    /// Said when asking for it ("your disc image (.iso) of ...").
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub check: Check,
+    /// Known good dumps of the disc image.
+    #[serde(default)]
+    pub dumps: Vec<Dump>,
+    /// A folder inside the game's folder the recomp reads the copy from (`assets`, `PSP_DATA`,
+    /// `.` for the game's folder itself). The launcher puts the copy there before each start: a
+    /// folder's contents as links, a disc image as a link (or a copy on another drive).
+    #[serde(default)]
+    pub into: String,
+    /// The name a single-file copy (a ROM) must have there, e.g. `sote.us.v1.2.z64`.
+    #[serde(default)]
+    pub name: String,
+    /// A disc image the launcher unpacks for a recomp that reads extracted files: "xdvdfs" (Xbox,
+    /// Xbox 360) or "iso9660" (PlayStation 2, PSP). The unpacked folder is then the copy.
+    #[serde(default)]
+    pub extract: String,
+    /// Made from the catalog's boot profile: its check is a common file (default.xex), so it isn't
+    /// used to recognise this game among the player's copies, only to check the one they pick.
+    #[serde(skip)]
+    pub generic: bool,
+    /// The game's own setup takes the copy (drag the ISO onto install.bat): the launcher asks for
+    /// it first and hands it to the setup, instead of placing it anywhere.
+    #[serde(skip)]
+    pub for_setup: bool,
+    /// What the folder the game reads must hold once the copy is there (`default.xex`, `Media`).
+    #[serde(skip)]
+    pub contains: Vec<String>,
+    /// A second file it needs beside the copy: the game's update (a title update package, say).
+    #[serde(default)]
+    pub update: Option<Extra>,
+}
+
+fn sha256_file(p: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(p)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex::encode(h.finalize()))
+}
+
+/// A file the game needs along with the player's copy, like its update, and where it goes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Extra {
+    /// A folder inside the game's folder it goes in (`game/Content`).
+    #[serde(default)]
+    pub into: String,
+    /// Said when asking for it.
+    #[serde(default)]
+    pub label: String,
+    /// "file", "folder" or "file or folder".
+    #[serde(default)]
+    pub accepts: String,
+    /// The game plays without it.
+    #[serde(default)]
+    pub optional: bool,
+    /// The name it must have there (it's put in under this name).
+    #[serde(default)]
+    pub name: String,
+    /// The one known file: checked when it's picked.
+    #[serde(default)]
+    pub sha256: String,
+}
+
+impl Extra {
+    fn dir(&self, install: &Path) -> Option<PathBuf> {
+        let into = self.into.trim().replace('\\', "/");
+        let into = into.trim_matches('/');
+        if into.is_empty() || into.contains(':') || into.split('/').any(|c| c == "..") {
+            return None;
+        }
+        Some(if into == "." { install.to_path_buf() } else { install.join(into) })
+    }
+
+    pub fn wants_folder(&self) -> bool {
+        self.accepts.to_ascii_lowercase().contains("folder")
+    }
+
+    pub fn wants_file(&self) -> bool {
+        let a = self.accepts.to_ascii_lowercase();
+        a.is_empty() || a.contains("file")
+    }
+
+    /// Whether this is the file asked for. Err says why not.
+    pub fn check(&self, p: &Path) -> Result<(), String> {
+        if p.is_dir() {
+            if !self.wants_folder() {
+                return Err("It needs the update's file, not a folder.".into());
+            }
+            return Ok(());
+        }
+        if !p.is_file() {
+            return Err("That file isn't there anymore.".into());
+        }
+        if !self.wants_file() {
+            return Err("It needs the update's folder, not a file.".into());
+        }
+        let sha = self.sha256.trim().to_ascii_lowercase();
+        if !sha.is_empty() {
+            let got = sha256_file(p).map_err(|e| format!("Couldn't read it: {e}"))?;
+            if got != sha {
+                return Err("That isn't the update this recomp needs. Use the one its page names, unchanged.".into());
+            }
+            return Ok(());
+        }
+        let name = self.name.trim();
+        if !name.is_empty() && !p.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case(name)).unwrap_or(false) {
+            return Err(format!("That isn't the update this recomp needs. Its file is named {name}."));
+        }
+        Ok(())
+    }
+
+    /// Already where the game reads it (put there by the player).
+    pub fn in_place(&self, install: &Path) -> Option<PathBuf> {
+        let dir = self.dir(install)?;
+        let name = self.name.trim();
+        if !name.is_empty() {
+            let p = dir.join(name);
+            return p.exists().then_some(p);
+        }
+        std::fs::read_dir(&dir).ok()?.flatten().next().map(|_| dir)
+    }
+
+    /// Puts it where the game reads it: a file as a hard link (or a copy on another drive), a
+    /// folder's contents the same way. What's already there stays.
+    pub fn place(&self, install: &Path, from: &Path) -> std::io::Result<()> {
+        let Some(dir) = self.dir(install) else { return Ok(()) };
+        if dir == from {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&dir)?;
+        let items: Vec<PathBuf> = if from.is_dir() { std::fs::read_dir(from)?.flatten().map(|e| e.path()).collect() } else { vec![from.to_path_buf()] };
+        let single = !from.is_dir();
+        for f in items {
+            let Some(n) = f.file_name() else { continue };
+            let name = self.name.trim();
+            let to = if single && !name.is_empty() && !name.contains(['/', '\\']) { dir.join(name) } else { dir.join(n) };
+            // An empty folder the release came with (targets/exefs, say) is a place for it, not
+            // something already there.
+            if empty_dir(&to) {
+                let _ = std::fs::remove_dir(&to);
+            }
+            // A link to a dump the player moved or deleted points nowhere: placed again. What's
+            // really there stays.
+            if dead_link(&to) {
+                remove_link(&to)?;
+            }
+            if to.symlink_metadata().is_ok() {
+                continue;
+            }
+            if f.is_dir() {
+                link_dir(&f, &to)?;
+            } else if std::fs::hard_link(&f, &to).is_err() {
+                copy_checked(&f, &to)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn iso() -> String {
+    "iso".into()
+}
+
+/// How to tell it's the right game: a file in the folder, or on the disc image.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Check {
+    /// In a folder.
+    #[serde(default)]
+    pub file: String,
+    /// On an Xbox 360 disc image.
+    #[serde(default)]
+    pub xdvdfs: String,
+    /// On a PlayStation 2 (or any ISO 9660) disc image, in its top folder.
+    #[serde(default)]
+    pub iso9660: String,
+    /// A Nintendo Switch or Switch 2 `.nup` package's build ID (hex, at least 8 digits; a prefix is fine),
+    /// read from its newest title's `exefs/main`. A folder with `exefs/main` is read the same way.
+    #[serde(default)]
+    pub nup_build_id: String,
+    /// An N64 ROM's region: the country letters it may have (`E` for USA).
+    #[serde(default)]
+    pub n64_region: String,
+    /// An N64 ROM's game: the two letters of its cartridge ID (`GE` for GoldenEye 007).
+    #[serde(default)]
+    pub n64_id: String,
+    /// An N64 ROM's revision (1 for a v1.1 release), when the recomp reads one revision only.
+    #[serde(default)]
+    pub n64_rev: Option<u8>,
+    /// The disc or cartridge IDs it reads (`GZ2E01`, or `GZ2` for every region): a GameCube or
+    /// Wii disc's, an N64 cartridge's game code, a PlayStation disc's serial (crate::roms::copy_id).
+    #[serde(default)]
+    pub ids: Vec<String>,
+}
+
+impl Check {
+    /// Nothing to check.
+    pub fn is_empty(&self) -> bool {
+        self.file.is_empty() && self.xdvdfs.is_empty() && self.iso9660.is_empty() && self.nup_build_id.is_empty() && self.n64_region.is_empty() && self.n64_id.is_empty() && self.n64_rev.is_none() && self.ids.is_empty()
+    }
+}
+
+impl GameCopy {
+    /// Whether anything about the copy is actually checked (a file in it, an id, a known dump), so
+    /// "it checks out" means something; otherwise the copy only has to be there.
+    pub fn checks_anything(&self) -> bool {
+        !self.check.is_empty() || !self.dumps.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Start {
+    /// The program to start, first one that exists (relative to the game's folder).
+    pub program: Vec<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables for the game, such as SDL hints. Paths fill in like everywhere else.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// A path, used when `if` (another path) exists, or always without one.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Place {
+    pub path: String,
+    #[serde(default, rename = "if")]
+    pub when: String,
+}
+
+/// A settings file the game reads.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Config {
+    /// A name settings refer to ("main" when there's one).
+    #[serde(default = "main")]
+    pub id: String,
+    /// "toml", "ini" or "json".
+    pub format: String,
+    /// Where it is: the first place that applies.
+    pub file: Vec<Place>,
+    /// The key that holds where the player's copy of the game is.
+    #[serde(default)]
+    pub game_path: String,
+    /// Set when missing (what the game needs to run right).
+    #[serde(default)]
+    pub ensure: BTreeMap<String, String>,
+    /// Set every time.
+    #[serde(default)]
+    pub always: BTreeMap<String, String>,
+    /// Set when the file is new.
+    #[serde(default)]
+    pub new: BTreeMap<String, String>,
+}
+
+fn main() -> String {
+    "main".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Setting {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub help: String,
+    /// "main" (a settings file's id) or "args" (passed when the game starts).
+    #[serde(default = "main", rename = "in")]
+    pub target: String,
+    /// What it can be set to. A slider has none.
+    #[serde(default)]
+    pub choices: Vec<Choice>,
+    /// The game's own values for keys the file doesn't have yet.
+    #[serde(default)]
+    pub defaults: BTreeMap<String, String>,
+    /// Only when these keys have these values (otherwise shown greyed out).
+    #[serde(default)]
+    pub when: BTreeMap<String, String>,
+    /// The heading it's shown under ("Controls"). Settings keep their order: a heading shows where
+    /// the group changes from one setting to the next.
+    #[serde(default)]
+    pub group: String,
+    /// Hidden until the player presses Show Advanced Options (its value stays as it is).
+    #[serde(default)]
+    pub advanced: bool,
+    /// A number on a slider instead of choices.
+    #[serde(default)]
+    pub slider: Option<Slider>,
+    /// For a slider on the command line ("in": "args"): its arguments, with {value} for the number.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Key bindings instead of choices: the game's actions and the keys each one is on.
+    #[serde(default)]
+    pub bindings: Option<Bindings>,
+    /// The launcher's own last choice, Match My Screen, was added (with the size or shape it writes).
+    #[serde(skip)]
+    pub screen: Option<String>,
+}
+
+/// Key bindings in a settings file, one key per action (`key.cross=Space`, same key rules as
+/// "set"), several keys on one action joined with `separator` (`Escape|Return`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Bindings {
+    #[serde(default)]
+    pub separator: String,
+    /// Keys one action can have (2 when not said).
+    #[serde(default)]
+    pub max: usize,
+    pub actions: Vec<BindAction>,
+    /// The launcher's name for a key or button, to the name the game's file uses for it
+    /// (`{"Return": "Enter"}`).
+    #[serde(default)]
+    pub names: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BindAction {
+    pub label: String,
+    pub key: String,
+    /// It takes a controller button too.
+    #[serde(default)]
+    pub pad: bool,
+}
+
+/// Names a key or button goes by, the launcher's own first: a file that already uses one of the
+/// others ("Enter", "Esc") gets that one.
+const KEY_NAMES: &[&[&str]] = &[
+    &["Return", "Enter"],
+    &["Escape", "Esc"],
+    &["Ctrl", "Control", "Ctl"],
+    &["Space", "Spacebar", "Space Bar"],
+    &["Backspace", "Back Space"],
+    &["Delete", "Del"],
+    &["Insert", "Ins"],
+    &["Page Up", "PageUp", "PgUp"],
+    &["Page Down", "PageDown", "PgDn"],
+    &["Up", "Arrow Up", "ArrowUp", "Up Arrow", "UpArrow"],
+    &["Down", "Arrow Down", "ArrowDown", "Down Arrow", "DownArrow"],
+    &["Left", "Arrow Left", "ArrowLeft", "Left Arrow", "LeftArrow"],
+    &["Right", "Arrow Right", "ArrowRight", "Right Arrow", "RightArrow"],
+    &["Mouse Left", "Mouse1", "Mouse 1", "LMB", "Left Mouse", "MouseLeft", "Left Click"],
+    &["Mouse Right", "Mouse2", "Mouse 2", "RMB", "Right Mouse", "MouseRight", "Right Click"],
+    &["Mouse Middle", "Mouse3", "Mouse 3", "MMB", "Middle Mouse", "MouseMiddle", "Middle Click"],
+    &["Mouse 4", "Mouse4", "Mouse Back", "XButton1", "Mouse X1"],
+    &["Mouse 5", "Mouse5", "Mouse Forward", "XButton2", "Mouse X2"],
+    &["Wheel Up", "Mouse Wheel Up", "MWheelUp", "WheelUp", "Scroll Up"],
+    &["Wheel Down", "Mouse Wheel Down", "MWheelDown", "WheelDown", "Scroll Down"],
+    &["A", "Cross"],
+    &["B", "Circle"],
+    &["X", "Square"],
+    &["Y", "Triangle"],
+    &["LB", "L1"],
+    &["RB", "R1"],
+    &["LT", "L2"],
+    &["RT", "R2"],
+    &["LS", "L3"],
+    &["RS", "R3"],
+    &["Back", "Select", "View", "Share", "Create"],
+    &["Start", "Options", "Menu"],
+    &["D-Pad Up", "DPad Up", "DPadUp"],
+    &["D-Pad Down", "DPad Down", "DPadDown"],
+    &["D-Pad Left", "DPad Left", "DPadLeft"],
+    &["D-Pad Right", "DPad Right", "DPadRight"],
+];
+
+impl Bindings {
+    pub fn max(&self) -> usize {
+        if self.max == 0 {
+            2
+        } else {
+            self.max.min(8)
+        }
+    }
+
+    pub fn sep(&self) -> &str {
+        if self.separator.is_empty() {
+            "|"
+        } else {
+            &self.separator
+        }
+    }
+
+    /// The keys in a value as written (`"Escape|Return"`, quotes or not), in their order.
+    pub fn split(&self, v: &str) -> Vec<String> {
+        let v = v.trim();
+        let v = if v.len() >= 2 && (v.starts_with('"') && v.ends_with('"') || v.starts_with('\'') && v.ends_with('\'')) { &v[1..v.len() - 1] } else { v };
+        v.split(self.sep()).map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect()
+    }
+
+    /// The name a key is written under: the profile's own name for it, else the one this file
+    /// already uses for that key, else the launcher's.
+    pub fn file_name(&self, name: &str, present: &[String]) -> String {
+        let group: Vec<&str> = KEY_NAMES.iter().find(|g| g.iter().any(|n| n.eq_ignore_ascii_case(name))).map(|g| g.to_vec()).unwrap_or_else(|| vec![name]);
+        let mut tries = vec![name];
+        tries.extend(group.iter().copied().filter(|n| !n.eq_ignore_ascii_case(name)));
+        for n in &tries {
+            if let Some(v) = self.names.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.trim()).filter(|v| !v.is_empty()) {
+                return v.to_string();
+            }
+        }
+        for n in &tries {
+            if let Some(p) = present.iter().find(|p| p.eq_ignore_ascii_case(n)) {
+                return p.clone();
+            }
+        }
+        name.to_string()
+    }
+}
+
+/// A slider: the key it sets (Section/Key in a settings file, like "set"), its range and step, and
+/// how the number is written (printf style: "%.2f", "%d"; "%g" when not said).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Slider {
+    #[serde(default)]
+    pub key: String,
+    pub min: f64,
+    pub max: f64,
+    #[serde(default)]
+    pub step: f64,
+    #[serde(default)]
+    pub format: String,
+    /// The same as the setting's "args", for a slider on the command line.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// A group of settings, by the name they use in "group". `advanced`: the whole group is hidden
+/// until the player shows advanced options.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Group {
+    pub id: String,
+    #[serde(default)]
+    pub advanced: bool,
+}
+
+impl Slider {
+    /// The step it moves by (a hundredth of the range when it doesn't say).
+    pub fn step(&self) -> f64 {
+        if self.step > 0.0 && self.step.is_finite() {
+            self.step
+        } else if self.max > self.min {
+            (self.max - self.min) / 100.0
+        } else {
+            1.0
+        }
+    }
+
+    /// Digits after the point in its step (and its ends), so 0.1 + 0.2 stays 0.3.
+    fn places(&self) -> usize {
+        let p = |x: f64| {
+            let s = format!("{x}");
+            s.split_once('.').map(|(_, d)| d.len()).unwrap_or(0).min(10)
+        };
+        p(self.step()).max(p(self.min)).max(p(self.max))
+    }
+
+    /// A number the player moved it to: on a step, inside its ends.
+    pub fn snap(&self, v: f64) -> f64 {
+        let (lo, hi) = if self.min <= self.max { (self.min, self.max) } else { (self.max, self.min) };
+        let st = self.step();
+        let n = ((v.clamp(lo, hi) - lo) / st).round();
+        let x = (lo + n * st).clamp(lo, hi);
+        let m = 10f64.powi(self.places() as i32);
+        (x * m).round() / m
+    }
+
+    /// The number written its way (printf style).
+    pub fn text(&self, v: f64) -> String {
+        printf(if self.format.trim().is_empty() { "%g" } else { self.format.trim() }, v)
+    }
+}
+
+/// A number in a printf-style format: %d, %i, %f, %.2f, %g, %.3g, %e, with text around it ("%.1fx").
+pub fn printf(fmt: &str, v: f64) -> String {
+    let re = regex_lite::Regex::new(r"%([+]?)(?:\.(\d+))?([dfgieFGE])").unwrap();
+    let Some(c) = re.captures(fmt) else { return gfmt(v, 6) };
+    let plus = !c[1].is_empty();
+    let prec = c.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
+    let body = match &c[3] {
+        "d" | "i" => format!("{}", v.round() as i64),
+        "f" | "F" => format!("{:.*}", prec.unwrap_or(6).min(12), v),
+        "e" | "E" => format!("{:.*e}", prec.unwrap_or(6).min(12), v),
+        _ => gfmt(v, prec.unwrap_or(6).clamp(1, 17)),
+    };
+    let body = if plus && v >= 0.0 { format!("+{body}") } else { body };
+    let m = c.get(0).unwrap();
+    format!("{}{}{}", &fmt[..m.start()], body, &fmt[m.end()..]).replace("%%", "%")
+}
+
+/// C's %g: `sig` significant digits, trailing zeros left off.
+fn gfmt(v: f64, sig: usize) -> String {
+    if v == 0.0 || !v.is_finite() {
+        return if v.is_finite() { "0".into() } else { format!("{v}") };
+    }
+    let exp = v.abs().log10().floor() as i32;
+    if exp < -4 || exp >= sig as i32 {
+        let s = format!("{:.*e}", sig.saturating_sub(1), v);
+        // 1.500000e3 -> 1.5e+03, as C writes it.
+        let (m, e) = s.split_once('e').unwrap_or((&s, "0"));
+        let m = if m.contains('.') { m.trim_end_matches('0').trim_end_matches('.') } else { m };
+        let e: i32 = e.parse().unwrap_or(0);
+        return format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs());
+    }
+    let decimals = (sig as i32 - 1 - exp).max(0) as usize;
+    let s = format!("{:.*}", decimals, v);
+    if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Choice {
+    pub label: String,
+    #[serde(default)]
+    pub set: BTreeMap<String, String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// A button: open a folder, or clear one.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Action {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub help: String,
+    #[serde(default)]
+    pub open: String,
+    #[serde(default)]
+    pub clear: String,
+}
+
+// ---------- finding a profile ----------
+
+/// Launcher-maintained profiles for official releases that ship without one.
+const BUILT_IN: &[&str] = &[
+    include_str!("../boot/dusklight.json"),
+    #[cfg(test)]
+    include_str!("../../docs/examples/fifawc14.json"),
+    #[cfg(test)]
+    include_str!("../../docs/examples/streetball.json"),
+];
+
+/// The profile for a game: the AppImage's embedded file, the folder's own, the catalog's, a built-in
+/// one for its repo, or one made from the catalog's boot profile when that
+/// says where the player's copy goes.
+pub fn find(game_dir: &Path, repo: &str, entry: &Value) -> Option<Profile> {
+    let mut p = find_own(game_dir, repo, entry).or_else(|| crate::boot::raw(entry).and_then(|b| from_boot(&b)))?;
+    p.lift_game();
+    to_apprun(&mut p, game_dir);
+    Some(p)
+}
+
+/// An AppImage unpacked at install (on Linux every game plays from a plain folder) is gone, its
+/// AppRun in its place: programs named `….AppImage` that aren't in the folder start the AppRun
+/// instead. The one in a folder named after the AppImage first (a release with several), else the
+/// one at the top.
+fn to_apprun(p: &mut Profile, dir: &Path) {
+    if dir.as_os_str().is_empty() {
+        return;
+    }
+    let swap = |programs: &mut Vec<String>| {
+        for prog in programs.iter_mut() {
+            let named = Path::new(prog.as_str());
+            let image = named.extension().map(|x| x.eq_ignore_ascii_case("appimage")).unwrap_or(false);
+            if !image || dir.join(named).is_file() {
+                continue;
+            }
+            let own = named.with_extension("").join("AppRun");
+            if dir.join(&own).is_file() {
+                *prog = own.to_string_lossy().replace('\\', "/");
+            } else if dir.join("AppRun").is_file() {
+                *prog = "AppRun".into();
+            }
+        }
+    };
+    if let Some(s) = p.start.as_mut() {
+        swap(&mut s.program);
+    }
+    if let Some(pr) = p.prepare.as_mut() {
+        swap(&mut pr.program);
+    }
+}
+
+/// From the catalog's boot profile (crate::boot): the player's copy and how it reaches the game,
+/// when it goes on the command line (`files.how: "flag"`) or into a folder (`"folder"`), and the
+/// game's settings the launcher can show (`settings: {config, settings}`).
+/// A program a profile names (`start.program`, `prepare.program`), as a path in the game's folder:
+/// the file itself, or on a Mac a Game.app, as the program inside it its Info.plist names, the one
+/// Play starts for a bundle anyway.
+pub fn named_program(path: PathBuf) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path);
+    }
+    let mac_app = crate::assets::os_now() == "macos" && crate::macos::is_bundle(&path);
+    if !mac_app {
+        return None;
+    }
+    crate::macos::bundle_executable(&path, crate::assets::arch_now())
+}
+
+/// A native build's program for the Windows one a game's setup names: the same name without its
+/// Windows and processor parts. pd.i686.exe is pd.x86_64, not pd.pal.x86_64 (a build for another
+/// region, with a word the Windows name doesn't have).
+pub fn native_twin(dir: &Path, win: &str) -> Option<PathBuf> {
+    const SKIP: [&str; 15] = ["exe", "i686", "i386", "x86", "x86_64", "x64", "amd64", "win32", "win64", "windows", "linux", "bin", "appimage", "sh", "64"];
+    let words = |n: &str| -> Vec<String> { n.to_lowercase().split(['.', '_', '-', ' ']).filter(|w| !w.is_empty() && !SKIP.contains(w)).map(String::from).collect() };
+    let want = words(Path::new(win).file_name()?.to_str()?);
+    if want.is_empty() {
+        return None;
+    }
+    let runnable = |p: &Path| -> bool {
+        let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+        if [".dll", ".so", ".exe", ".txt", ".md", ".ini", ".cfg", ".json", ".pdb", ".zip", ".7z", ".dat", ".bin"].iter().any(|e| n.ends_with(e)) || n.contains(".so.") {
+            return false;
+        }
+        if n.ends_with(".x86_64") || n.ends_with(".appimage") || n.ends_with(".sh") {
+            return true;
+        }
+        // A program, by its run permission or its first bytes (an ELF): zips made on Windows drop
+        // the permission.
+        let elf = || {
+            let mut head = [0u8; 4];
+            std::fs::File::open(p).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)).is_ok() && &head == b"\x7fELF"
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(p).map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false) || elf()
+        }
+        #[cfg(not(unix))]
+        elf()
+    };
+    let mut best: Option<(usize, usize, PathBuf)> = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if !p.is_file() || !runnable(&p) {
+            continue;
+        }
+        let name = p.file_name()?.to_string_lossy().to_string();
+        let have = words(&name);
+        if !want.iter().all(|w| have.contains(w)) {
+            continue;
+        }
+        let extra = have.iter().filter(|w| !want.contains(w)).count();
+        if best.as_ref().map(|(x, l, _)| (extra, name.len()) < (*x, *l)).unwrap_or(true) {
+            best = Some((extra, name.len(), p));
+        }
+    }
+    best.map(|(_, _, p)| p)
+}
+
+/// A .NET app host on Linux finds the runtime only where .NET put it system-wide. When the
+/// player's runtime lives elsewhere (~/.dotnet, a folder it downloaded) the host stops at once
+/// with "You must install .NET". A release's own start script finds that runtime and sets
+/// DOTNET_ROOT before starting the host, so when a game's profile resolves to such a host, Play
+/// starts the script instead.
+fn through_start_script(host: PathBuf) -> PathBuf {
+    if !cfg!(target_os = "linux") {
+        return host;
+    }
+    let Some(dir) = host.parent() else { return host };
+    let Some(name) = host.file_name().map(|n| n.to_string_lossy().to_string()) else { return host };
+    if !dir.join(format!("{name}.runtimeconfig.json")).is_file() {
+        return host;
+    }
+    crate::linux_twin(&host).unwrap_or(host)
+}
+
+pub fn from_boot(b: &Value) -> Option<Profile> {
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let (config, settings) = boot_settings(b);
+    let copy = boot_copy(b);
+    if copy.is_none() && settings.is_empty() {
+        return None;
+    }
+    // `files.how: "env"`: the copy reaches the game through an environment variable it reads
+    // (`files.env`, e.g. STRIKERS_DATA), a disc image or a folder alike.
+    let mut env = BTreeMap::new();
+    if let Some(f) = b.get("files").filter(|f| s(f, "how") == "env") {
+        let name = s(f, "env");
+        if env_name_ok(&name) {
+            env.insert(name, "{game}".to_string());
+        }
+    }
+    Some(Profile {
+        format: 1,
+        start: copy.as_ref().map(|(_, args)| Start { program: crate::boot::starts(b), args: args.clone(), env: env.clone() }),
+        game: copy.map(|(g, _)| g),
+        config,
+        settings,
+        groups: b.get("settings").and_then(|v| v.get("groups")).and_then(|g| serde_json::from_value::<Vec<Group>>(g.clone()).ok()).unwrap_or_default(),
+        from_boot: true,
+        ..Default::default()
+    })
+}
+
+/// The settings a boot profile describes, when they're sound: each one in a file it lists (or on
+/// the command line), with at least two choices.
+fn boot_settings(b: &Value) -> (Vec<Config>, Vec<Setting>) {
+    let Some(v) = b.get("settings").filter(|v| v.is_object()) else { return (vec![], vec![]) };
+    let config: Vec<Config> = v.get("config").and_then(|c| serde_json::from_value::<Vec<Config>>(c.clone()).ok()).unwrap_or_default();
+    let config: Vec<Config> = config
+        .into_iter()
+        .filter(|c| matches!(c.format.as_str(), "toml" | "ini" | "json") && !c.file.is_empty() && c.file.iter().all(|p| safe_place(&p.path) && (p.when.is_empty() || safe_place(&p.when))))
+        // Only what the player picks is written: nothing on every start.
+        .map(|c| Config { game_path: String::new(), ensure: BTreeMap::new(), always: BTreeMap::new(), new: BTreeMap::new(), ..c })
+        .collect();
+    let settings: Vec<Setting> = v.get("settings").and_then(|c| serde_json::from_value::<Vec<Setting>>(c.clone()).ok()).unwrap_or_default();
+    let settings: Vec<Setting> = settings
+        .into_iter()
+        .filter(|st| {
+            (st.choices.len() >= 2
+                || st.slider.as_ref().map(|sl| sl.min < sl.max && (st.target != "args" || st.args.iter().chain(sl.args.iter()).any(|a| a.contains("{value}")))).unwrap_or(false)
+                || st.bindings.as_ref().map(|b| st.target != "args" && !b.actions.is_empty() && b.actions.iter().all(|a| !a.key.trim().is_empty())).unwrap_or(false))
+                && (st.target == "args" || config.iter().any(|c| c.id == st.target))
+        })
+        .collect();
+    let used: Vec<Config> = config.into_iter().filter(|c| settings.iter().any(|st| st.target == c.id)).collect();
+    (used, settings)
+}
+
+/// A settings file's place from the catalog: in the game's folder or the player's own folders, never
+/// out of them.
+fn safe_place(p: &str) -> bool {
+    let p = p.trim().replace('\\', "/");
+    ["{install}/", "{data}/", "{documents}/", "{local}/", "{config}/", "{home}/"].iter().any(|r| p.starts_with(r)) && !p.split('/').any(|c| c == "..")
+}
+
+/// The player's copy, when the boot profile says it goes on the command line or into a folder:
+/// what it is, and the arguments the game starts with.
+fn boot_copy(b: &Value) -> Option<(GameCopy, Vec<String>)> {
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let f = b.get("files")?;
+    let how = s(f, "how");
+    let start = s(b, "start");
+    if start.is_empty() || !matches!(how.as_str(), "flag" | "folder" | "setup" | "env") {
+        return None;
+    }
+    let flag = s(f, "flag");
+    let into = s(f, "folder");
+    // A flag, or none: the copy as the first thing on the command line.
+    if (how == "flag" && !flag.is_empty() && !flag.starts_with('-')) || (how == "folder" && (into.is_empty() || into.contains(".."))) {
+        return None;
+    }
+    let accepts = s(f, "accepts").to_ascii_lowercase();
+    let contains_early: Vec<String> = f.get("contains").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_ascii_lowercase).collect()).unwrap_or_default();
+    let extract = match s(f, "extract").as_str() {
+        x @ ("xdvdfs" | "iso9660") => x.to_string(),
+        // A recomp that reads the disc's files from a folder and takes the disc image too, without
+        // saying how to unpack it: an Xbox or Xbox 360 disc (it has default.xbe or default.xex) is
+        // unpacked like one, so the folder ends up with the files the game reads, not the image.
+        _ if how == "folder" && accepts.contains("iso") && accepts.contains("folder") && contains_early.iter().any(|c| c == "default.xbe" || c == "default.xex") => "xdvdfs".to_string(),
+        _ if how == "folder" && accepts.contains("iso") && accepts.contains("folder") && contains_early.iter().any(|c| c == "system.cnf") => "iso9660".to_string(),
+        _ => String::new(),
+    };
+    let kind = if !extract.is_empty() || (accepts.contains("iso") && accepts.contains("folder")) {
+        "iso_or_folder"
+    } else if accepts.contains("iso") || accepts == "file" {
+        "iso"
+    } else {
+        "folder"
+    };
+    let contains: Vec<String> = f.get("contains").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+    // A file it must have, to check the folder picked (a folder name like `code` can't be checked
+    // as a file, so only names with a dot).
+    let check_file = contains.iter().find(|c| c.contains('.')).cloned().unwrap_or_default();
+    // A ROM the game reads under one name only.
+    let name = if how == "folder" && kind == "iso" && contains.len() == 1 && contains[0].contains('.') && !contains[0].contains(['/', '\\', '*']) { contains[0].clone() } else { String::new() };
+    let what = s(f, "what");
+    // A disc image the game reads as it is: checked to be one it can read when it's picked.
+    let image_file = if s(f, "check_image") == "xdvdfs" && kind == "iso" { "default.xex".to_string() } else { String::new() };
+    // The game's update, when it needs one beside the copy.
+    let update = f.get("update").filter(|u| u.is_object()).map(|u| Extra {
+        into: s(u, "folder"),
+        label: { let w = s(u, "what"); if w.is_empty() || w.ends_with('.') { w } else { format!("{w}.") } },
+        accepts: s(u, "accepts"),
+        optional: u.get("optional").and_then(Value::as_bool).unwrap_or(false),
+        name: s(u, "name"),
+        sha256: s(u, "sha256"),
+    }).filter(|x| x.dir(Path::new("/x")).is_some() && !x.label.is_empty() && !x.name.contains(['/', '\\']));
+    let mut args: Vec<String> = crate::split_args(&s(b, "args"));
+    if how == "flag" {
+        if !flag.is_empty() {
+            args.push(flag);
+        }
+        args.push("{game}".into());
+    }
+    Some((
+        GameCopy {
+            kind: kind.into(),
+            label: if what.is_empty() || what.ends_with('.') { what.clone() } else { format!("{what}.") },
+            check: Check {
+                // On the disc image too, when the launcher unpacks it: the same file at its top.
+                xdvdfs: if extract == "xdvdfs" { check_file.clone() } else { image_file },
+                iso9660: if extract == "iso9660" { contains.first().cloned().unwrap_or_default() } else { String::new() },
+                file: if kind == "iso" { String::new() } else { check_file },
+                n64_region: s(f, "region").to_ascii_uppercase(),
+                n64_id: s(f, "n64_id").to_ascii_uppercase(),
+                n64_rev: f.get("n64_rev").and_then(Value::as_u64).map(|v| v as u8),
+                ids: f.get("ids").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default(),
+                nup_build_id: String::new(),
+            },
+            into: if how == "folder" { into } else { String::new() },
+            name,
+            extract,
+            generic: true,
+            for_setup: how == "setup",
+            contains: if how == "folder" { contains.clone() } else { vec![] },
+            update,
+            ..Default::default()
+        },
+        args,
+    ))
+}
+
+/// A release-owned profile and its source, shared with Developer tools.
+pub(crate) struct ReleaseProfile {
+    pub profile: Profile,
+    pub raw: Value,
+    pub location: String,
+    pub embedded: bool,
+}
+
+/// Rewrite AppImage program entries to the actual container's name. All paths
+/// still resolve from the install directory, never from a temporary mount.
+fn bind_image(raw: &mut Value, image: &Path) -> Option<()> {
+    let name = image.file_name()?.to_str()?;
+    for field in ["start", "prepare"] {
+        if let Some(programs) = raw.get_mut(field).and_then(|v| v.get_mut("program")).and_then(Value::as_array_mut) {
+            for program in programs {
+                if program.as_str().and_then(|s| Path::new(s).extension()).and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("appimage")) == Some(true)
+                {
+                    *program = Value::String(name.to_string());
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// Embedded metadata belongs to the installed image and wins over a stale
+/// sidecar. Unsupported, missing or unreadable metadata keeps the old fallback.
+pub(crate) fn release_profile(dir: &Path) -> Option<ReleaseProfile> {
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    let parse = |bytes: &[u8], image: Option<&Path>| -> Option<ReleaseProfile> {
+        let mut raw: Value = serde_json::from_slice(bytes).ok()?;
+        if let Some(image) = image {
+            bind_image(&mut raw, image)?;
+        }
+        let profile: Profile = serde_json::from_value(raw.clone()).ok()?;
+        if profile.format != 1 {
+            return None;
+        }
+        Some(ReleaseProfile {
+            profile,
+            raw,
+            embedded: image.is_some(),
+            location: image.map(|p| format!("{}!/recomplauncher.json", p.display()))
+                .unwrap_or_else(|| dir.join(crate::appimage::MANIFEST).display().to_string()),
+        })
+    };
+    if let Some(image) = crate::appimage::installed_image(dir) {
+        if let Some(owned) = crate::appimage::manifest(&image).ok().and_then(|b| parse(&b, Some(&image))) {
+            return Some(owned);
+        }
+    }
+    let bytes = std::fs::read(dir.join(crate::appimage::MANIFEST)).ok()?;
+    parse(&bytes, None)
+}
+
+fn find_own(game_dir: &Path, repo: &str, entry: &Value) -> Option<Profile> {
+    let ok = |p: Profile| (p.format == 1).then_some(p);
+    if let Some(owned) = release_profile(game_dir) {
+        return Some(owned.profile);
+    }
+    if let Some(p) = entry.get("launcher").and_then(|v| serde_json::from_value::<Profile>(v.clone()).ok()).and_then(ok) {
+        return Some(p);
+    }
+    BUILT_IN
+        .iter()
+        .filter_map(|t| serde_json::from_str::<Profile>(t).ok())
+        .find(|p| !repo.is_empty() && p.repo.eq_ignore_ascii_case(repo))
+}
+
+// ---------- paths ----------
+
+static PAD: std::sync::RwLock<&'static str> = std::sync::RwLock::new("xbox");
+
+/// The kind of controller in use, for `{pad}`: "xbox" or "playstation".
+pub fn set_pad(kind: &'static str) {
+    *PAD.write().unwrap() = kind;
+}
+
+/// The controller kind `{pad}` stands for right now.
+pub fn pad_now() -> &'static str {
+    *PAD.read().unwrap()
+}
+
+/// A name a game's environment may take: letters, digits and _, not starting with a digit, and
+/// never one of the launcher's own or the ones Windows and Linux need to find programs.
+pub fn env_name_ok(k: &str) -> bool {
+    let mut c = k.chars();
+    matches!(c.next(), Some(x) if x.is_ascii_alphabetic() || x == '_')
+        && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
+        && k.len() <= 64
+        && !k.to_ascii_uppercase().starts_with("RECOMPLAUNCHER")
+        && !matches!(k.to_ascii_uppercase().as_str(), "PATH" | "PATHEXT" | "SYSTEMROOT" | "WINDIR" | "COMSPEC" | "LD_PRELOAD" | "LD_LIBRARY_PATH" | "HOME" | "USERPROFILE" | "APPDATA" | "LOCALAPPDATA" | "TEMP" | "TMP")
+}
+
+thread_local! {
+    /// Filling in for a Windows program that runs through Proton or Wine on Linux: the player's copy
+    /// is given the way Windows programs name it there (Z:\run\media\...).
+    static WINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A Linux path as a Windows program running under Proton or Wine reads it.
+pub fn wine_path(p: &str) -> String {
+    if p.starts_with('/') {
+        format!("Z:{}", p.replace('/', "\\"))
+    } else {
+        p.to_string()
+    }
+}
+
+/// While it's alive, filling in is for a Windows program under Proton (when `on`).
+pub struct WineFill(bool);
+impl WineFill {
+    pub fn new(on: bool) -> Self {
+        WineFill(WINE.with(|w| w.replace(on)))
+    }
+}
+impl Drop for WineFill {
+    fn drop(&mut self) {
+        WINE.with(|w| w.set(self.0));
+    }
+}
+
+/// Fills in {install}, {documents}, {local}, {config}, {home}, {game} and {pad}.
+/// `{appdata}`: where this system keeps programs' own data, the folder SDL-based games save in
+/// (AppData\\Roaming on Windows, Application Support on a Mac, ~/.local/share on Linux). One word
+/// for all three, so a save copied on one system lands in the right place on another.
+pub fn app_data() -> Option<PathBuf> {
+    if cfg!(windows) {
+        dirs::config_dir()
+    } else if cfg!(target_os = "macos") {
+        dirs::data_dir()
+    } else {
+        dirs::data_local_dir()
+    }
+}
+
+/// The one folder a game keeps everything it writes in (saves, settings, caches), inside its own
+/// folder: `{data}` in its recomplauncher.json, and RECOMPLAUNCHER_DATA when it starts. A name no
+/// game uses: releases ship a `data` folder of their own (TotK's does), and 11 catalog games
+/// already write or ship a top-level `userdata` (the same folder as `UserData` on Windows).
+pub const DATA_DIR: &str = "recompdata";
+
+/// `{data}` for a game in `install`.
+pub fn data_dir(install: &Path) -> PathBuf {
+    install.join(DATA_DIR)
+}
+
+pub fn fill(t: &str, install: &Path, game: Option<&Path>) -> String {
+    if !t.contains('{') {
+        return t.to_string();
+    }
+    let s = |p: Option<PathBuf>| p.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    t.replace("{pad}", &PAD.read().unwrap())
+        .replace("{data}", &data_dir(install).to_string_lossy())
+        .replace("{install}", &install.to_string_lossy())
+        .replace("{documents}", &s(dirs::document_dir().or_else(|| dirs::home_dir().map(|h| h.join("Documents")))))
+        .replace("{appdata}", &s(app_data()))
+        .replace("{local}", &s(dirs::data_local_dir()))
+        .replace("{config}", &s(dirs::config_dir()))
+        .replace("{home}", &s(dirs::home_dir()))
+        .replace("{game}", &game.map(|g| { let s = g.to_string_lossy().to_string(); if WINE.with(|w| w.get()) { wine_path(&s) } else { s } }).unwrap_or_default())
+}
+
+/// The first place that applies.
+/// A settings file that isn't where the profile says, found beside it: the same name in other
+/// letter case (Linux tells them apart), or the one `*.cfg.json` a new version of the game writes
+/// under another name.
+fn near_config(path: &Path) -> Option<PathBuf> {
+    let dir = path.parent()?;
+    let want = path.file_name()?.to_string_lossy().to_lowercase();
+    let entries: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+    if let Some(p) = entries.iter().find(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase() == want).unwrap_or(false)) {
+        return Some(p.clone());
+    }
+    if want.ends_with(".cfg.json") {
+        let cfgs: Vec<&PathBuf> = entries.iter().filter(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase().ends_with(".cfg.json")).unwrap_or(false)).collect();
+        if cfgs.len() == 1 {
+            return Some(cfgs[0].clone());
+        }
+    }
+    None
+}
+
+/// A real folder (not a link) with nothing in it.
+fn empty_dir(p: &Path) -> bool {
+    p.symlink_metadata().map(|m| m.is_dir() && !m.file_type().is_symlink()).unwrap_or(false) && std::fs::read_dir(p).map(|mut r| r.next().is_none()).unwrap_or(false)
+}
+
+/// A copy of the player's file into the game's folder (another drive, so no link), after checking
+/// it fits: a big copy (a whole disc) that fills the drive halfway helps nobody.
+fn copy_checked(from: &Path, to: &Path) -> std::io::Result<()> {
+    let size = std::fs::metadata(from).map(|m| m.len()).unwrap_or(0);
+    if let Some(free) = crate::manage::free_space(to.parent().unwrap_or(to)) {
+        if free < size.saturating_add(64 << 20) {
+            let gb = |b: u64| format!("{:.1} GB", b as f64 / 1_073_741_824.0);
+            return Err(std::io::Error::other(format!(
+                "Not enough space to copy {} ({}) into the game's folder: {} is free on that drive. Free some space, or keep your game files on the same drive as your library so they don't need copying.",
+                from.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                gb(size),
+                gb(free)
+            )));
+        }
+    }
+    std::fs::copy(from, to).map(|_| ())
+}
+
+pub fn place(list: &[Place], install: &Path) -> Option<PathBuf> {
+    list.iter().find(|p| p.when.is_empty() || Path::new(&fill(&p.when, install, None)).exists()).map(|p| PathBuf::from(fill(&p.path, install, None)))
+}
+
+// ---------- settings files ----------
+
+/// A settings file, edited line by line so its comments and order stay as they are.
+pub struct File {
+    path: PathBuf,
+    format: String,
+    lines: Vec<String>,
+    json: serde_json::Map<String, Value>,
+    pub existed: bool,
+}
+
+fn key_line(format: &str, key: &str) -> regex_lite::Regex {
+    let k = regex_lite::escape(key);
+    if format == "ini" {
+        regex_lite::Regex::new(&format!(r"^(\s*{k}\s*=\s*)([^;#]*?)(\s*(?:[;#].*)?)$")).unwrap()
+    } else {
+        regex_lite::Regex::new(&format!(r#"^(\s*{k}\s*=\s*)((?:"[^"]*"|[^#\s])*)(.*)$"#)).unwrap()
+    }
+}
+
+impl File {
+    pub fn open(path: PathBuf, format: &str) -> File {
+        let text = std::fs::read_to_string(&path).ok();
+        let existed = text.is_some();
+        let text = text.unwrap_or_default();
+        let json = if format == "json" { serde_json::from_str::<Value>(&text).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default() } else { Default::default() };
+        File { path, format: format.into(), lines: text.lines().map(|l| l.trim_end_matches('\r').to_string()).collect(), json, existed }
+    }
+
+    /// A key and the section it's in: `Graphics/Fullscreen` is `Fullscreen` under `[Graphics]` (INI
+    /// sections, TOML tables). A plain key is looked for anywhere, as before.
+    fn split<'a>(&self, key: &'a str) -> (Option<&'a str>, &'a str) {
+        match key.split_once('/') {
+            Some((sec, k)) if self.format != "json" && !sec.trim().is_empty() && !k.trim().is_empty() => (Some(sec.trim()), k.trim()),
+            _ => (None, key),
+        }
+    }
+
+    fn is_header(l: &str) -> Option<&str> {
+        let t = l.trim();
+        (t.starts_with('[') && !t.starts_with("[[") && t.contains(']')).then(|| t[1..t.find(']').unwrap()].trim())
+    }
+
+    /// The lines a key may be on: a section's (without its header), or the whole file.
+    fn range(&self, sec: Option<&str>) -> Option<(usize, usize)> {
+        let Some(sec) = sec else { return Some((0, self.lines.len())) };
+        let ini = self.format == "ini";
+        let start = self.lines.iter().position(|l| Self::is_header(l).map(|h| if ini { h.eq_ignore_ascii_case(sec) } else { h == sec }).unwrap_or(false))? + 1;
+        let end = self.lines[start..].iter().position(|l| l.trim().starts_with('[')).map(|i| start + i).unwrap_or(self.lines.len());
+        Some((start, end))
+    }
+
+    /// A setting's value as written (strings with their quotes).
+    pub fn get(&self, key: &str) -> Option<String> {
+        if self.format == "json" {
+            // `CVars/gInternalResolution`: inside nested objects.
+            let mut parts = key.split('/');
+            let mut v = self.json.get(parts.next()?)?;
+            for p in parts {
+                v = v.get(p)?;
+            }
+            return Some(v.to_string());
+        }
+        let (sec, k) = self.split(key);
+        let (a, b) = self.range(sec)?;
+        let re = key_line(&self.format, k);
+        self.lines[a..b].iter().find_map(|l| re.captures(l).map(|c| c[2].to_string()))
+    }
+
+    pub fn set(&mut self, key: &str, value: &str) {
+        if self.format == "json" {
+            let v = serde_json::from_str::<Value>(value).unwrap_or(Value::String(value.into()));
+            let parts: Vec<&str> = key.split('/').collect();
+            let (last, path) = parts.split_last().unwrap();
+            let mut obj = &mut self.json;
+            for p in path {
+                let e = obj.entry(p.to_string()).or_insert_with(|| Value::Object(Default::default()));
+                if !e.is_object() {
+                    *e = Value::Object(Default::default());
+                }
+                obj = e.as_object_mut().unwrap();
+            }
+            obj.insert(last.to_string(), v);
+            return;
+        }
+        let (sec, k) = self.split(key);
+        let re = key_line(&self.format, k);
+        if let Some((a, b)) = self.range(sec) {
+            for l in self.lines[a..b].iter_mut() {
+                if let Some(c) = re.captures(l) {
+                    *l = format!("{}{}{}", &c[1], value, &c[3]);
+                    return;
+                }
+            }
+            // Written out but commented (`;VH_SCALE=2`, `# vsync = true`): that line, switched on, in its own style.
+            let off = regex_lite::Regex::new(&format!(r"^\s*[;#]+\s*({}\s*=\s*)", regex_lite::escape(k))).unwrap();
+            if let Some(i) = (a..b).find(|i| off.is_match(&self.lines[*i])) {
+                let lead = off.captures(&self.lines[i]).map(|c| c[1].to_string()).unwrap_or_else(|| format!("{k} = "));
+                self.lines[i] = format!("{lead}{value}");
+                return;
+            }
+            // Not there yet: at the end of its section, or for a TOML top-level key, before the
+            // first table (after it, the key would belong to that table).
+            let at = if sec.is_none() && self.format == "toml" {
+                self.lines.iter().position(|l| l.trim().starts_with('[')).unwrap_or(self.lines.len())
+            } else {
+                b
+            };
+            let at = (a..at).rev().find(|i| !self.lines[*i].trim().is_empty()).map(|i| i + 1).unwrap_or(a);
+            let eq = self.eq_style();
+            self.lines.insert(at, format!("{k}{eq}{value}"));
+            return;
+        }
+        if self.lines.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
+            self.lines.push(String::new());
+        }
+        let eq = self.eq_style();
+        self.lines.push(format!("[{}]", sec.unwrap_or_default()));
+        self.lines.push(format!("{k}{eq}{value}"));
+    }
+
+    /// How the file writes `=`: `key=value` or `key = value`, so a new line reads like the rest
+    /// (some games don't trim the spaces).
+    fn eq_style(&self) -> &'static str {
+        let re = regex_lite::Regex::new(r"^\s*[A-Za-z0-9_.\-]+(\s*)=(\s*)\S").unwrap();
+        match self.lines.iter().find_map(|l| re.captures(l).map(|c| (c[1].is_empty(), c[2].is_empty()))) {
+            Some((true, true)) => "=",
+            _ => " = ",
+        }
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        if let Some(d) = self.path.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        let text = if self.format == "json" {
+            serde_json::to_string_pretty(&self.json).unwrap_or_default() + "\n"
+        } else {
+            self.lines.iter().map(|l| format!("{l}\n")).collect()
+        };
+        let tmp = self.path.with_extension("rltmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, &self.path)
+    }
+}
+
+/// Two values as the same setting: quotes aside, numbers by value, words in any case.
+fn same(a: &str, b: &str) -> bool {
+    let un = |x: &str| x.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_string();
+    let (a, b) = (un(a), un(b));
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => (x - y).abs() < 1e-6,
+        _ => a.eq_ignore_ascii_case(&b),
+    }
+}
+
+/// A path as a value in the file's own syntax.
+pub fn path_value(format: &str, p: &Path) -> String {
+    match format {
+        "json" => Value::String(p.to_string_lossy().to_string()).to_string(),
+        "ini" => p.to_string_lossy().to_string(),
+        // TOML basic strings treat \ as an escape: forward slashes, as the games' own launchers write.
+        _ => format!("\"{}\"", p.to_string_lossy().replace('\\', "/").replace('"', "")),
+    }
+}
+
+/// What the folder a copy goes in (`into`) is still missing of what it must hold (empty: all there).
+pub fn missing_in(g: &GameCopy, install: &Path) -> Vec<String> {
+    let into = g.into.trim().trim_matches(['/', '\\']);
+    if into.is_empty() || into.contains("..") || g.contains.is_empty() {
+        return vec![];
+    }
+    let dir = if into == "." { install.to_path_buf() } else { install.join(into) };
+    // An empty folder doesn't count: a release can come with the folders the player's files go in.
+    // Nor does a link to a dump the player moved or deleted.
+    let there = |e: &std::fs::DirEntry| !empty_dir(&e.path()) && !dead_link(&e.path());
+    let names: Vec<String> = std::fs::read_dir(&dir).into_iter().flatten().flatten().filter(there).map(|e| e.file_name().to_string_lossy().to_lowercase()).collect();
+    g.contains
+        .iter()
+        .filter(|c| !c.contains(['*', '/', '\\']))
+        .filter(|c| !names.contains(&c.to_lowercase()))
+        .cloned()
+        .collect()
+}
+
+/// The copy's files already where the game reads them (put there by the player, or placed before):
+/// the folder they're in. Then no copy has to be picked.
+pub fn in_place(g: &GameCopy, install: &Path) -> Option<PathBuf> {
+    let into = g.into.trim().trim_matches(['/', '\\']);
+    if into.is_empty() || into.contains("..") || !g.contains.iter().any(|c| !c.contains(['*', '/', '\\'])) {
+        return None;
+    }
+    if !missing_in(g, install).is_empty() {
+        return None;
+    }
+    Some(if into == "." { install.to_path_buf() } else { install.join(into) })
+}
+
+impl Profile {
+    /// `game` (and its `update`) as named inputs, first in the list: `game` and `update`, with every
+    /// rule they had. Named inputs are the one way to ask for files; a manifest written with `game`
+    /// reads the same as one written with inputs. `{game}` keeps filling in with the main input.
+    /// After this `game` is None; `main_copy` gives its rules back, read from the input.
+    /// Beta only: removed before 1.0, when no manifest writes `game` any more (the store's boot
+    /// profiles are made as inputs by then).
+    pub fn lift_game(&mut self) {
+        let Some(g) = self.game.take() else { return };
+        let mut lifted = vec![crate::inputs::Input::from_copy(&g)];
+        if let Some(up) = g.update.as_ref() {
+            lifted.push(crate::inputs::Input::from_extra(up));
+        }
+        // An input of the same id the manifest declares itself is the developer's: theirs stays.
+        lifted.retain(|l| !self.inputs.iter().any(|i| i.id == l.id));
+        self.inputs.splice(0..0, lifted);
+    }
+
+    /// The rules of the player's copy: the main input's, as `GameCopy` (a profile not lifted yet,
+    /// in a test, has them in `game`).
+    pub fn main_copy(&self) -> Option<GameCopy> {
+        self.game.clone().or_else(|| self.main_input().filter(|i| i.role != "runtime").map(crate::inputs::Input::as_copy))
+    }
+
+    /// The input the game's big copy box is for: the first one the player picks with role game,
+    /// else the first one they pick.
+    pub fn main_input(&self) -> Option<&crate::inputs::Input> {
+        let picked = || self.inputs.iter().filter(|i| i.picked() && i.role != "update" && i.role != "key");
+        picked().find(|i| i.role == "game").or_else(|| picked().next())
+    }
+
+    /// Easy Setup, the same rule as the website's: it starts a program and takes the player's copy
+    /// of the game, or it asks for the game or its disc as a required input.
+    pub fn easy_setup(&self) -> bool {
+        (self.start.is_some() && self.main_copy().is_some()) || self.inputs.iter().any(|i| !i.optional && (i.role == "game" || i.role == "disc"))
+    }
+
+    pub fn config_file(&self, id: &str, install: &Path) -> Option<File> {
+        let c = self.config.iter().find(|c| c.id == id)?;
+        let path = place(&c.file, install)?;
+        let path = if path.exists() { path } else { near_config(&path).unwrap_or(path) };
+        Some(File::open(path, &c.format))
+    }
+
+    fn program_for(&self, install: &Path, windows_build: bool) -> Option<PathBuf> {
+        let s = self.start.as_ref()?;
+        let twin = || if cfg!(windows) { None } else { s.program.iter().find_map(|p| native_twin(install, p)) };
+        let program = (if windows_build { None } else { twin() })
+            .or_else(|| s.program.iter().find_map(|p| named_program(install.join(p))))
+            .or_else(twin)?;
+        // A .NET app host on Linux needs the start script a release ships with it (see
+        // `through_start_script`), whether the profile named the Windows program or the host itself.
+        Some(if cfg!(windows) { program } else { through_start_script(program) })
+    }
+
+    /// The selected program is a Windows one that plays through Proton here. Leftover Windows
+    /// files must not turn a native build's config, environment or input paths into Windows paths.
+    pub fn through_proton(&self, install: &Path) -> bool {
+        !cfg!(windows) && self.program_for(install, self.windows_build.unwrap_or(true))
+            .is_some_and(|e| e.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")))
+    }
+
+    /// The file the game is given for the player's copy, by its `game` (`GameCopy::file_for`).
+    pub fn handed(&self, game: Option<&Path>) -> Option<PathBuf> {
+        let copy = game?;
+        Some(self.main_copy().map(|g| g.file_for(copy)).unwrap_or_else(|| copy.to_path_buf()))
+    }
+
+    pub fn prepare(&self, install: &Path, game: Option<&Path>) -> std::io::Result<()> {
+        let handed = self.handed(game);
+        let game = handed.as_deref();
+        let _w = WineFill::new(self.through_proton(install));
+        for c in &self.config {
+            // A path put into a TOML or JSON string: forward slashes, so the backslashes aren't escapes.
+            let fill = |v: &str, install: &Path, game: Option<&Path>| {
+                let f = fill(v, install, game);
+                if c.format != "ini" && ["{install}", "{data}", "{game}", "{documents}", "{local}", "{config}", "{home}"].iter().any(|k| v.contains(k)) { f.replace('\\', "/") } else { f }
+            };
+            let Some(path) = place(&c.file, install) else { continue };
+            let mut f = File::open(path, &c.format);
+            let mut set = false;
+            for (k, v) in &c.ensure {
+                if f.get(k).map(|x| x.is_empty()).unwrap_or(true) {
+                    f.set(k, &fill(v, install, game));
+                    set = true;
+                }
+            }
+            for (k, v) in &c.always {
+                f.set(k, &fill(v, install, game));
+                set = true;
+            }
+            if !f.existed {
+                for (k, v) in &c.new {
+                    f.set(k, &fill(v, install, game));
+                    set = true;
+                }
+            }
+            if let (false, Some(g)) = (c.game_path.is_empty(), game) {
+                f.set(&c.game_path, &path_value(&c.format, g));
+                set = true;
+            }
+            // A file that isn't there yet, with nothing to put in it, is left for the game: an
+            // empty one would stop a game that writes its own defaults only when it's missing
+            // (PrimeRecomp's primerecomp.ini).
+            if !f.existed && !set {
+                continue;
+            }
+            f.save()?;
+        }
+        Ok(())
+    }
+
+    /// The program and its arguments, with the settings that go on the command line.
+    /// `start.env`, filled in; names that aren't allowed are left out.
+    /// Puts the player's copy where the recomp reads it (`game.into`), before a start. A folder's
+    /// files and folders go in as links (junctions on Windows), a disc image as a hard link, or a
+    /// copy when it's on another drive. What's already there stays.
+    pub fn place(&self, install: &Path, game: Option<&Path>) -> std::io::Result<()> {
+        let (Some(g), Some(copy)) = (self.main_copy(), game) else { return Ok(()) };
+        let into = g.into.trim().trim_matches(['/', '\\']);
+        if into.is_empty() || into.contains("..") {
+            return Ok(());
+        }
+        let dir = if into == "." { install.to_path_buf() } else { install.join(into) };
+        // The copy picked is that folder already.
+        if dir == copy {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&dir)?;
+        let mut items: Vec<PathBuf> = if copy.is_dir() { std::fs::read_dir(copy)?.flatten().map(|e| e.path()).collect() } else { vec![copy.to_path_buf()] };
+        // A .cue or .gdi is only the table of contents: the tracks it names come along too (and an
+        // .m3u's discs with theirs).
+        if !copy.is_dir() {
+            let tracks = sheet_tracks(copy);
+            // The game wants the disc's one .bin under its own name (ctr-u.bin), and the player
+            // picked the sheet: the track it names goes there, not the sheet renamed.
+            if tracks.len() == 1 && g.name.trim().to_ascii_lowercase().ends_with(".bin") {
+                items = tracks;
+            } else {
+                items.extend(tracks);
+            }
+        }
+        let single = !copy.is_dir();
+        let first = items.first().cloned();
+        for from in items {
+            let Some(name) = from.file_name() else { continue };
+            let to = if single && Some(&from) == first.as_ref() && !g.name.trim().is_empty() && !g.name.contains(['/', '\\']) { dir.join(g.name.trim()) } else { dir.join(name) };
+            // A ROM put there in the wrong byte order by an older version: done again.
+            if single && to.is_file() {
+                let head = std::fs::File::open(&to).ok().and_then(|mut f| read_at(&mut f, 0, 4));
+                if head.as_deref().and_then(n64_order).map(|o| o != 0).unwrap_or(false) && to.extension().map(|e| e.eq_ignore_ascii_case("z64")).unwrap_or(false) {
+                    let _ = std::fs::remove_file(&to);
+                }
+            }
+            // An empty folder the release came with (targets/exefs, say) is a place for it, not
+            // something already there.
+            if empty_dir(&to) {
+                let _ = std::fs::remove_dir(&to);
+            }
+            // A link to a dump the player moved or deleted points nowhere: placed again. What's
+            // really there stays.
+            if dead_link(&to) {
+                remove_link(&to)?;
+            }
+            if to.symlink_metadata().is_ok() {
+                continue;
+            }
+            if from.is_dir() {
+                link_dir(&from, &to)?;
+            } else if place_z64(&from, &to)? {
+                continue;
+            } else if std::fs::hard_link(&from, &to).is_err() {
+                copy_checked(&from, &to)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// After `place`: what the game's folder is still missing of what it must hold (empty: all there).
+    pub fn missing_after_place(&self, install: &Path) -> Vec<String> {
+        self.main_copy().map(|g| missing_in(&g, install)).unwrap_or_default()
+    }
+
+    /// The game's files already where it reads them (put there by the player): the folder they're
+    /// in. Then no copy has to be picked.
+    /// Its setup step's finished files (`prepare.done`): None when it lists none, else whether
+    /// every one is there.
+    pub fn build_done(&self, install: &Path) -> Option<bool> {
+        let done = &self.prepare.as_ref()?.done;
+        if done.is_empty() {
+            return None;
+        }
+        Some(done.iter().all(|d| Path::new(&fill(d, install, None)).exists()))
+    }
+
+    /// Whether starting the game hands it the player's copy ({game} in its arguments or
+    /// variables). When it doesn't, a finished build is all it needs.
+    pub fn start_uses_game(&self) -> bool {
+        let main = self.main_input().map(|i| format!("{{input:{}}}", i.id));
+        let names = |a: &String| a.contains("{game}") || main.as_ref().is_some_and(|m| a.contains(m.as_str()));
+        self.start.as_ref().is_some_and(|s| s.args.iter().chain(s.env.values()).any(names))
+    }
+
+    /// The game's own folder (the first `folders.game`) when it has a setup step and nothing says
+    /// what it leaves, and that folder already holds files: a build made before, by this
+    /// launcher or the developer's own.
+    /// The folder this game's setup builds it into (its first `folders.game`), filled in, when the
+    /// game is built from the player's copy and that folder isn't the game's own: a build the player
+    /// has somewhere else can stand in for it.
+    pub fn build_home(&self, install: &Path) -> Option<PathBuf> {
+        self.prepare.as_ref()?;
+        self.start.as_ref()?;
+        let first = self.folders.get("game")?.first()?;
+        if first.path.contains("{game}") {
+            return None;
+        }
+        let dir = PathBuf::from(fill(&first.path, install, None));
+        // (A folder inside the game's own counts: a build from before the setup moved there can
+        // still stand in for it.)
+        (dir.is_absolute() && dir != install).then_some(dir)
+    }
+
+    /// What a step that keeps the copy (`prepare.keeps_copy`) kept from it: its build folder, when
+    /// it's there with files in it. A build folder that's gone took what it kept with it.
+    pub fn kept_from_copy(&self, install: &Path) -> Option<PathBuf> {
+        if !self.prepare.as_ref()?.keeps_copy {
+            return None;
+        }
+        let home = self.build_home(install)?;
+        let has_files = std::fs::read_dir(&home).ok()?.flatten().next().is_some();
+        has_files.then_some(home)
+    }
+
+    pub fn already_in_place(&self, install: &Path) -> Option<PathBuf> {
+        in_place(&self.main_copy()?, install)
+    }
+
+    pub fn env_vars(&self, install: &Path, game: Option<&Path>) -> Vec<(String, String)> {
+        let handed = self.handed(game);
+        let game = handed.as_deref();
+        let through_proton = self.through_proton(install);
+        let _w = WineFill::new(through_proton);
+        self.start.as_ref().map(|s| s.env.iter().filter(|(k, _)| env_name_ok(k)).filter_map(|(k, v)| {
+            let value = crate::inputs::expand(&fill(v, install, game), &self.input_paths, through_proton);
+            (!value.contains("{input:")).then(|| (k.clone(), value))
+        }).collect()).unwrap_or_default()
+    }
+
+    pub fn command(&self, install: &Path, game: Option<&Path>, picks: &BTreeMap<String, usize>) -> Option<(PathBuf, Vec<String>)> {
+        self.command_for(install, game, picks, self.windows_build.unwrap_or(true))
+    }
+
+    /// The command it runs. `windows_build`: the installed build is the Windows one (on Windows, or
+    /// through Proton), so the profile's Windows program comes first. With a native build, a program
+    /// with the same name comes first: an old `.exe` left beside it (a switch from the Windows build)
+    /// must not hide the native one.
+    /// A game its setup step builds (`prepare`) and then starts from the folder it built
+    /// ("--play {home}/Games/Game", or "--play {install}/Game"): that folder, when it isn't there.
+    /// Built somewhere the player then moved or deleted, or a manifest that now builds somewhere
+    /// else (Hookshot moving from {home}/Games into its install folder), it can't start, and
+    /// building it again puts it back.
+    pub fn built_folder_missing(&self, install: &Path) -> Option<PathBuf> {
+        self.prepare.as_ref()?;
+        let s = self.start.as_ref()?;
+        // Inside the game's own folder only the folder its setup builds into counts: other
+        // {install} paths in `start` are the release's own files, not something it built.
+        let home_inside = self.build_home(install).filter(|h| h.starts_with(install));
+        let outside = ["{home}/", "{documents}/", "{local}/", "{config}/", "{appdata}/"];
+        s.args.iter().find_map(|a| {
+            let p = PathBuf::from(fill(a, install, None));
+            let built_outside = outside.iter().any(|r| a.starts_with(r));
+            let built_inside = a.starts_with("{install}/") && home_inside.as_ref().is_some_and(|h| p.starts_with(h));
+            let ours = built_outside || built_inside;
+            (ours && !p.exists()).then_some(p)
+        })
+    }
+
+    /// Whether `exe` is the program its start names (in any of its forms: the Windows one, or the
+    /// native build by that name on Linux and Mac).
+    pub fn starts_program(&self, exe: &Path) -> bool {
+        let Some(s) = self.start.as_ref() else { return false };
+        let low = |p: &Path, ext: bool| (if ext { p.extension() } else { p.file_name() }).map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let name = low(exe, false);
+        s.program.iter().any(|p| {
+            let want = Path::new(p);
+            let want_name = low(want, false);
+            // Game.AppImage for Game-nightly-4-x86_64.AppImage, as Play finds it.
+            let base = want_name.split('.').next().unwrap_or_default();
+            let twin = matches!(low(want, true).as_str(), "appimage" | "");
+            // The program inside Game.app, for "Game.app", as named_program finds it.
+            let in_bundle = want_name.ends_with(".app") && exe.ancestors().any(|a| low(a, false) == want_name);
+            want_name == name || in_bundle || (twin && !base.is_empty() && name.starts_with(base) && low(want, true) == low(exe, true))
+        })
+    }
+
+    pub fn command_for(&self, install: &Path, game: Option<&Path>, picks: &BTreeMap<String, usize>, windows_build: bool) -> Option<(PathBuf, Vec<String>)> {
+        let exe = self.program_for(install, windows_build)?;
+        let through_proton = !cfg!(windows) && exe.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe"));
+        crate::boot::runnable(&exe);
+        Some((exe, self.expanded_args(install, game, picks, through_proton)))
+    }
+
+    /// The command line it gives its program: its own arguments (the player's copy among them) and
+    /// the settings that go there.
+    pub fn args_for(&self, install: &Path, game: Option<&Path>, picks: &BTreeMap<String, usize>) -> Vec<String> {
+        self.expanded_args(install, game, picks, self.through_proton(install))
+    }
+
+    fn expanded_args(&self, install: &Path, game: Option<&Path>, picks: &BTreeMap<String, usize>, through_proton: bool) -> Vec<String> {
+        let handed = self.handed(game);
+        let game = handed.as_deref();
+        let _w = WineFill::new(through_proton);
+        let Some(s) = self.start.as_ref() else { return vec![] };
+        let mut args: Vec<String> = s.args.iter().map(|a| fill(a, install, game)).collect();
+        for st in self.settings.iter().filter(|s| s.target == "args") {
+            if let Some(c) = picks.get(&st.id).and_then(|i| st.choices.get(*i)) {
+                args.extend(c.args.iter().map(|a| fill(a, install, game)));
+            }
+            args.extend(self.slider_args(st).into_iter().map(|a| fill(&a, install, game)));
+        }
+        crate::inputs::arguments(&args, &self.input_paths, through_proton)
+    }
+
+    /// A command-line slider the player moved: its arguments with the number in place of {value}.
+    /// Not moved: nothing, so the game keeps its own value.
+    fn slider_args(&self, st: &Setting) -> Vec<String> {
+        let (Some(sl), Some(v)) = (st.slider.as_ref(), self.slider_vals.get(&st.id)) else { return vec![] };
+        let list = if st.args.is_empty() { &sl.args } else { &st.args };
+        list.iter().map(|a| a.replace("{value}", v)).collect()
+    }
+
+    /// Whether a setting is hidden behind Show Advanced Options: itself, or its whole group.
+    pub fn is_advanced(&self, st: &Setting) -> bool {
+        st.advanced || (!st.group.is_empty() && self.groups.iter().any(|g| g.advanced && g.id == st.group))
+    }
+
+    /// A slider's value now, exactly as written: in its file (or the player's, on the command line),
+    /// else the game's default, else its low end. Never rounded or rewritten here.
+    pub fn slider_now(&self, st: &Setting, install: &Path) -> Option<String> {
+        let sl = st.slider.as_ref()?;
+        let un = |x: &str| x.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_string();
+        let key = if sl.key.is_empty() { st.id.as_str() } else { sl.key.as_str() };
+        let now = if st.target == "args" { self.slider_vals.get(&st.id).cloned() } else { self.config_file(&st.target, install).and_then(|f| f.get(key)) };
+        Some(now.or_else(|| st.defaults.get(key).cloned()).map(|v| un(&v)).filter(|v| !v.is_empty()).unwrap_or_else(|| sl.text(sl.min)))
+    }
+
+    /// The player moved a slider: the number, on a step and written its way, goes into its file in
+    /// the file's own style (quoted when the value there is). On the command line the caller keeps
+    /// it. Gives back what was written.
+    pub fn set_slider(&self, install: &Path, id: &str, value: f64) -> Result<String, String> {
+        let st = self.settings.iter().find(|s| s.id == id).ok_or("That isn't one of its settings.")?;
+        let sl = st.slider.as_ref().ok_or("That setting isn't a slider.")?;
+        if !value.is_finite() {
+            return Err("That isn't a number.".into());
+        }
+        let text = sl.text(sl.snap(value));
+        if st.target == "args" {
+            return Ok(text);
+        }
+        let key = if sl.key.is_empty() { st.id.as_str() } else { sl.key.as_str() };
+        let mut f = self.config_file(&st.target, install).ok_or("Its settings file couldn't be found.")?;
+        if self.from_boot && !f.existed {
+            return Err("Play the game once first: it makes its settings file then.".into());
+        }
+        let now = f.get(key).map(|v| v.trim().to_string()).unwrap_or_default();
+        let q = now.chars().next().filter(|c| (*c == '"' || *c == '\'') && now.len() >= 2 && now.ends_with(*c));
+        let out = match q {
+            Some(q) => format!("{q}{text}{q}"),
+            None => text.clone(),
+        };
+        f.set(key, &out);
+        f.save().map_err(|e| format!("Couldn't save its settings: {e}"))?;
+        Ok(text)
+    }
+
+    /// A bindings setting's actions now: each one's keys as its file has them (or the game's
+    /// defaults), in order.
+    pub fn bindings_now(&self, st: &Setting, install: &Path) -> Vec<Vec<String>> {
+        let Some(b) = st.bindings.as_ref() else { return vec![] };
+        let f = self.config_file(&st.target, install);
+        b.actions.iter().map(|a| f.as_ref().and_then(|f| f.get(&a.key)).or_else(|| st.defaults.get(&a.key).cloned()).map(|v| b.split(&v)).unwrap_or_default()).collect()
+    }
+
+    /// Whether any action of a bindings setting is on other keys than the game's defaults.
+    pub fn bindings_changed(&self, st: &Setting, install: &Path) -> bool {
+        let Some(b) = st.bindings.as_ref() else { return false };
+        b.actions.iter().zip(self.bindings_now(st, install)).any(|(a, now)| st.defaults.get(&a.key).map(|d| b.split(d) != now).unwrap_or(false))
+    }
+
+    /// A value written the way its file writes them: quoted in JSON and TOML, and in an INI file
+    /// when the value there was.
+    fn bind_text(f: &File, key: &str, text: &str) -> String {
+        match f.format.as_str() {
+            "json" => Value::String(text.to_string()).to_string(),
+            _ => {
+                let now = f.get(key).map(|v| v.trim().to_string()).unwrap_or_default();
+                let q = now.chars().next().filter(|c| (*c == '"' || *c == '\'') && now.len() >= 2 && now.ends_with(*c)).or(if f.format == "toml" { Some('"') } else { None });
+                match q {
+                    Some(q) => format!("{q}{}{q}", text.replace(q, "")),
+                    None => text.to_string(),
+                }
+            }
+        }
+    }
+
+    /// The player set an action's keys. Keys it already had stay as written; new ones get the
+    /// name the file uses for them. Nothing is written when nothing changed. Gives back the keys
+    /// as written.
+    pub fn set_binding(&self, install: &Path, id: &str, action: &str, keys: &[String]) -> Result<Vec<String>, String> {
+        let st = self.settings.iter().find(|s| s.id == id).ok_or("That isn't one of its settings.")?;
+        let b = st.bindings.as_ref().ok_or("That setting isn't a list of keys.")?;
+        let act = b.actions.iter().find(|a| a.key == action).ok_or("That isn't one of its actions.")?;
+        let mut f = self.config_file(&st.target, install).ok_or("Its settings file couldn't be found.")?;
+        if self.from_boot && !f.existed {
+            return Err("Play the game once first: it makes its settings file then.".into());
+        }
+        let now = f.get(&act.key).or_else(|| st.defaults.get(&act.key).cloned()).map(|v| b.split(&v)).unwrap_or_default();
+        // Every name this setting uses already, in the file and in the game's defaults.
+        let present: Vec<String> = b.actions.iter().flat_map(|a| f.get(&a.key).into_iter().chain(st.defaults.get(&a.key).cloned())).flat_map(|v| b.split(&v)).collect();
+        let mut out: Vec<String> = vec![];
+        for k in keys.iter().map(|k| k.trim()).filter(|k| !k.is_empty() && !k.contains(b.sep())) {
+            let name = if present.iter().any(|p| p == k) { k.to_string() } else { b.file_name(k, &present) };
+            if !out.iter().any(|o| o.eq_ignore_ascii_case(&name)) {
+                out.push(name);
+            }
+            if out.len() >= b.max() {
+                break;
+            }
+        }
+        if out == now {
+            return Ok(out);
+        }
+        let text = Self::bind_text(&f, &act.key, &out.join(b.sep()));
+        f.set(&act.key, &text);
+        f.save().map_err(|e| format!("Couldn't save its settings: {e}"))?;
+        Ok(out)
+    }
+
+    /// Reset to Default: every action back on the game's own keys, where the file has others.
+    pub fn reset_bindings(&self, install: &Path, id: &str) -> Result<(), String> {
+        let st = self.settings.iter().find(|s| s.id == id).ok_or("That isn't one of its settings.")?;
+        let b = st.bindings.as_ref().ok_or("That setting isn't a list of keys.")?;
+        let mut f = self.config_file(&st.target, install).ok_or("Its settings file couldn't be found.")?;
+        let mut changed = false;
+        for a in &b.actions {
+            let (Some(d), Some(now)) = (st.defaults.get(&a.key), f.get(&a.key)) else { continue };
+            if b.split(d) != b.split(&now) {
+                let text = Self::bind_text(&f, &a.key, &b.split(d).join(b.sep()));
+                f.set(&a.key, &text);
+                changed = true;
+            }
+        }
+        if changed {
+            f.save().map_err(|e| format!("Couldn't save its settings: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// A value the game wrote itself (in its own menu) that isn't one of a setting's choices: as
+    /// written, to show as it is. Only for a setting whose choices all set the same one key.
+    pub fn own_value(&self, st: &Setting, install: &Path) -> Option<String> {
+        if st.target == "args" || st.slider.is_some() || st.bindings.is_some() || st.choices.is_empty() {
+            return None;
+        }
+        let keys: std::collections::BTreeSet<&String> = st.choices.iter().flat_map(|c| c.set.keys()).collect();
+        if keys.len() != 1 || st.choices.iter().any(|c| c.set.len() != 1) {
+            return None;
+        }
+        let k = keys.into_iter().next()?;
+        let v = self.config_file(&st.target, install)?.get(k)?;
+        if st.choices.iter().any(|c| c.set.get(k).map(|x| same(x, &v)).unwrap_or(false)) {
+            return None;
+        }
+        let v = v.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_string();
+        (!v.is_empty()).then_some(v)
+    }
+
+    /// Which choice each setting is on (the first whose values all match), and whether it applies.
+    pub fn current(&self, install: &Path, picks: &BTreeMap<String, usize>) -> Vec<(usize, bool)> {
+        let mut files: BTreeMap<String, File> = BTreeMap::new();
+        for c in &self.config {
+            if let Some(f) = self.config_file(&c.id, install) {
+                files.insert(c.id.clone(), f);
+            }
+        }
+        self.settings
+            .iter()
+            .map(|st| {
+                if st.target == "args" {
+                    return (picks.get(&st.id).copied().filter(|i| *i < st.choices.len()).unwrap_or(0), true);
+                }
+                let Some(f) = files.get(&st.target) else { return (0, true) };
+                let val = |k: &str| f.get(k).or_else(|| st.defaults.get(k).cloned()).unwrap_or_default();
+                // Written by the game in its own way (`1.0` for `1`): matched loosely, and when no
+                // choice matches, the one with the game's defaults.
+                let i = st
+                    .choices
+                    .iter()
+                    .position(|c| c.set.iter().all(|(k, v)| same(&val(k), v)))
+                    .or_else(|| st.choices.iter().position(|c| c.set.iter().all(|(k, v)| st.defaults.get(k).map(|d| same(d, v)).unwrap_or(false))))
+                    .unwrap_or(0);
+                let applies = st.when.iter().all(|(k, v)| same(&val(k), v) || (f.get(k).is_none() && self.default_of(k).map(|d| same(&d, v)).unwrap_or(false)));
+                (i, applies)
+            })
+            .collect()
+    }
+
+    /// The arguments the settings on the command line add (for a profile that doesn't say how the
+    /// game starts: the launcher starts the program as usual, with these).
+    pub fn setting_args(&self, install: &Path, picks: &BTreeMap<String, usize>) -> Vec<String> {
+        let mut args = vec![];
+        for st in self.settings.iter().filter(|s| s.target == "args") {
+            if let Some(c) = picks.get(&st.id).and_then(|i| st.choices.get(*i)) {
+                args.extend(c.args.iter().map(|a| fill(a, install, None)));
+            }
+            args.extend(self.slider_args(st).into_iter().map(|a| fill(&a, install, None)));
+        }
+        args
+    }
+
+    /// Whether a settings file its settings change isn't there yet (the game makes it on its first start).
+    pub fn waiting_for_files(&self, install: &Path) -> bool {
+        self.settings.iter().filter(|s| s.target != "args").any(|s| self.config_file(&s.target, install).map(|f| !f.existed).unwrap_or(true))
+    }
+
+    /// The values its settings have in their files, to put back after an update replaces the files.
+    pub fn kept(&self, install: &Path) -> Vec<(String, String, String)> {
+        let mut out = vec![];
+        for c in &self.config {
+            let Some(f) = self.config_file(&c.id, install).filter(|f| f.existed) else { continue };
+            let mut keys: Vec<&String> = self
+                .settings
+                .iter()
+                .filter(|s| s.target == c.id)
+                .flat_map(|s| s.choices.iter().flat_map(|ch| ch.set.keys()).chain(s.slider.as_ref().map(|sl| if sl.key.is_empty() { &s.id } else { &sl.key })).chain(s.bindings.iter().flat_map(|b| b.actions.iter().map(|a| &a.key))))
+                .collect();
+            keys.sort();
+            keys.dedup();
+            for k in keys {
+                if let Some(v) = f.get(k) {
+                    out.push((c.id.clone(), k.clone(), v));
+                }
+            }
+        }
+        out
+    }
+
+    /// Puts back what `kept` read, where an update changed it.
+    pub fn restore(&self, install: &Path, kept: &[(String, String, String)]) {
+        for c in &self.config {
+            let mine: Vec<_> = kept.iter().filter(|(id, _, _)| *id == c.id).collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let Some(mut f) = self.config_file(&c.id, install).filter(|f| f.existed) else { continue };
+            let mut changed = false;
+            for (_, k, v) in mine {
+                // Only keys the new file still has.
+                if f.get(k).map(|now| now != *v).unwrap_or(false) {
+                    f.set(k, v);
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = f.save();
+            }
+        }
+    }
+
+    fn default_of(&self, key: &str) -> Option<String> {
+        self.settings.iter().find_map(|s| s.defaults.get(key).cloned())
+    }
+
+    /// Put a setting on one of its choices (a settings file's settings; "args" ones are kept by the caller).
+    pub fn pick(&self, install: &Path, id: &str, choice: usize) -> Result<(), String> {
+        let st = self.settings.iter().find(|s| s.id == id).ok_or("That isn't one of its settings.")?;
+        let c = st.choices.get(choice).ok_or("That isn't one of its choices.")?;
+        if st.target == "args" {
+            return Ok(());
+        }
+        let mut f = self.config_file(&st.target, install).ok_or("Its settings file couldn't be found.")?;
+        // The launcher's own settings for a game only change a file the game made.
+        if self.from_boot && !f.existed {
+            return Err("Play the game once first: it makes its settings file then.".into());
+        }
+        for (k, v) in &c.set {
+            f.set(k, v);
+        }
+        f.save().map_err(|e| format!("Couldn't save its settings: {e}"))
+    }
+
+    pub fn folder(&self, name: &str, install: &Path) -> Option<PathBuf> {
+        place(self.folders.get(name)?, install)
+    }
+}
+
+// ---------- Match My Screen ----------
+
+impl Profile {
+    /// A last choice, Match My Screen, on each setting that writes a resolution (width and height
+    /// keys, or one "WxH" value) or a screen shape (a number like 1.777, or "16:9"), when all its
+    /// choices are plain values in one format: the main monitor's size or shape, written the way
+    /// the other choices are. Settings with named choices ("Stretch") are left as they are.
+    pub fn add_screen_choices(&mut self, screen: Option<(u32, u32)>) {
+        let Some((w, h)) = screen.filter(|(w, h)| *w >= 320 && *h >= 200) else { return };
+        for st in self.settings.iter_mut() {
+            if st.target == "args" || st.slider.is_some() || st.bindings.is_some() || st.choices.len() < 2 || st.screen.is_some() {
+                continue;
+            }
+            if let Some((set, shown)) = screen_values(st, w, h) {
+                st.choices.push(Choice { label: format!("Match my screen \u{b7} {shown}"), set, args: vec![] });
+                st.screen = Some(shown);
+            }
+        }
+    }
+
+    /// Before Play, after the monitor changed: the settings the player put on Match My Screen get
+    /// its size or shape now, where the file doesn't have it already. Gives back the ones it wrote.
+    pub fn follow_screen(&self, install: &Path, ids: &[String]) -> Vec<String> {
+        let mut out = vec![];
+        for st in self.settings.iter().filter(|s| s.screen.is_some() && ids.contains(&s.id)) {
+            let last = st.choices.len() - 1;
+            let Some(f) = self.config_file(&st.target, install).filter(|f| f.existed) else { continue };
+            let on = st.choices[last].set.iter().all(|(k, v)| f.get(k).map(|x| same(&x, v)).unwrap_or(false));
+            if !on && self.pick(install, &st.id, last).is_ok() {
+                out.push(st.id.clone());
+            }
+        }
+        out
+    }
+}
+
+/// The common name of a screen's shape ("21:9" for 3440x1440), or its own when none is close.
+pub fn shape_name(w: u32, h: u32) -> String {
+    const SHAPES: [(u32, u32); 9] = [(4, 3), (5, 4), (3, 2), (16, 10), (5, 3), (16, 9), (21, 9), (32, 10), (32, 9)];
+    let r = w as f64 / h as f64;
+    let (best, err) = SHAPES.iter().map(|&(a, b)| ((a, b), ((a as f64 / b as f64) - r).abs() / r)).fold(((0, 0), f64::MAX), |m, x| if x.1 < m.1 { x } else { m });
+    if err <= 0.035 {
+        return format!("{}:{}", best.0, best.1);
+    }
+    let g = gcd(w, h);
+    format!("{}:{}", w / g, h / g)
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a.max(1) } else { gcd(b, a % b) }
+}
+
+/// What Match My Screen writes on this setting, and what it shows ("3440\u{d7}1440", "21:9"); None
+/// when its choices aren't all plain sizes or shapes in one format.
+fn screen_values(st: &Setting, w: u32, h: u32) -> Option<(BTreeMap<String, String>, String)> {
+    let keys: Vec<&String> = st.choices[0].set.keys().collect();
+    if keys.is_empty() || st.choices.iter().any(|c| !c.args.is_empty() || c.set.keys().collect::<Vec<_>>() != keys) {
+        return None;
+    }
+    let plain = |v: &str| -> Option<u32> { let v = v.trim(); (!v.is_empty() && v.len() <= 5 && v.bytes().all(|b| b.is_ascii_digit())).then(|| v.parse().ok()).flatten() };
+    let size = format!("{w}\u{d7}{h}");
+    let hint = |k: &str, words: &[&str]| { let k = k.to_ascii_lowercase(); words.iter().any(|w| k.contains(w)) };
+    if keys.len() == 2 {
+        // Width and height in their own keys: whole numbers, the width the bigger one in each.
+        let (a, b) = (keys[0], keys[1]);
+        let mut pairs = vec![];
+        for c in &st.choices {
+            pairs.push((plain(&c.set[a])?, plain(&c.set[b])?));
+        }
+        let fits = |p: &[(u32, u32)]| p.iter().all(|&(x, y)| y >= 200 && x <= 16384 && (x as f64 / y as f64) >= 1.2 && (x as f64 / y as f64) <= 4.0);
+        let flipped: Vec<(u32, u32)> = pairs.iter().map(|&(x, y)| (y, x)).collect();
+        let named = |k: &str, end: char| hint(k, &["width", "height", "res", "size"]) || k.to_ascii_lowercase().ends_with(end) || k.to_ascii_lowercase().ends_with(if end == 'x' { 'w' } else { 'h' });
+        let (wk, hk) = if fits(&pairs) { (a, b) } else if fits(&flipped) { (b, a) } else { return None };
+        if !named(wk, 'x') || !named(hk, 'y') {
+            return None;
+        }
+        return Some((BTreeMap::from([(wk.clone(), w.to_string()), (hk.clone(), h.to_string())]), size));
+    }
+    if keys.len() != 1 {
+        return None;
+    }
+    let k = keys[0];
+    // A text value in the file's own syntax keeps its quotes ("\"1280x720\"" in TOML or JSON): read
+    // inside them, and written with the same ones.
+    let unq = |v: &str| -> (String, String) {
+        let v = v.trim();
+        for q in ["\"", "'"] {
+            if v.len() >= 2 && v.starts_with(q) && v.ends_with(q) {
+                return (v[1..v.len() - 1].trim().to_string(), q.to_string());
+            }
+        }
+        (v.to_string(), String::new())
+    };
+    let parsed: Vec<(String, String)> = st.choices.iter().map(|c| unq(&c.set[k])).collect();
+    let q = parsed[0].1.clone();
+    if parsed.iter().any(|(_, x)| *x != q) {
+        return None;
+    }
+    let vals: Vec<&str> = parsed.iter().map(|(v, _)| v.as_str()).collect();
+    // "1280x720": the same separator in each (x, X, the times sign or *, with or without spaces).
+    let split = |v: &str| -> Option<(String, String, String)> {
+        let i = v.find(|c: char| !c.is_ascii_digit())?;
+        let j = v.rfind(|c: char| !c.is_ascii_digit())?;
+        let j = j + v[j..].chars().next()?.len_utf8();
+        let (x, sep, y) = (&v[..i], &v[i..j], &v[j..]);
+        let mid = sep.trim();
+        (plain(x).is_some() && plain(y).is_some() && ["x", "X", "\u{d7}", "*"].contains(&mid)).then(|| (x.to_string(), sep.to_string(), y.to_string()))
+    };
+    if let Some(first) = split(vals[0]) {
+        if vals.iter().all(|v| split(v).map(|p| p.1 == first.1 && plain(&p.0).unwrap_or(0) > plain(&p.2).unwrap_or(u32::MAX)).unwrap_or(false)) {
+            return Some((BTreeMap::from([(k.clone(), format!("{q}{w}{}{h}{q}", first.1))]), size));
+        }
+        return None;
+    }
+    let shape = shape_name(w, h);
+    // "16:9": a shape, written the same way.
+    let ratio = |v: &str| -> Option<String> { let (x, y) = v.split_once(':')?; (plain(x).is_some() && plain(y).is_some()).then(|| v[x.len()..v.len() - y.len()].to_string()) };
+    if let Some(sep) = ratio(vals[0]) {
+        if vals.iter().all(|v| ratio(v).as_deref() == Some(sep.as_str())) {
+            let (x, y) = shape.split_once(':')?;
+            return Some((BTreeMap::from([(k.clone(), format!("{q}{x}{sep}{y}{q}"))]), shape));
+        }
+        return None;
+    }
+    // 1.777: a shape as a number, on a setting that says it's one, with as many decimals as the others.
+    if !hint(k, &["aspect", "ratio", "shape"]) && !hint(&st.label, &["aspect", "ratio", "shape"]) && !hint(&st.id, &["aspect", "ratio", "shape"]) {
+        return None;
+    }
+    let num = |v: &str| -> Option<(f64, usize)> {
+        let d = v.split_once('.').map(|(_, f)| f.len()).unwrap_or(0);
+        (v.bytes().all(|b| b.is_ascii_digit() || b == b'.') && v.matches('.').count() <= 1).then(|| v.parse::<f64>().ok().filter(|x| (1.0..=4.0).contains(x)).map(|x| (x, d))).flatten()
+    };
+    let mut decimals = 0;
+    for v in &vals {
+        decimals = decimals.max(num(v)?.1);
+    }
+    if decimals == 0 {
+        return None;
+    }
+    Some((BTreeMap::from([(k.clone(), format!("{q}{:.*}{q}", decimals, w as f64 / h as f64))]), shape))
+}
+
+// ---------- the player's copy ----------
+
+fn read_at(f: &mut std::fs::File, at: u64, n: usize) -> Option<Vec<u8>> {
+    f.seek(SeekFrom::Start(at)).ok()?;
+    let mut b = vec![0u8; n];
+    f.read_exact(&mut b).ok()?;
+    Some(b)
+}
+
+#[derive(Debug, PartialEq)]
+enum Holds {
+    Nothing,
+    OnlyMedia,
+    Files,
+}
+
+/// What a folder picked as the player's copy holds, a few levels down: nothing, only pictures,
+/// videos and documents, or other files. Windows' own notes about a folder don't count.
+fn folder_holds(p: &Path) -> Holds {
+    let mut stack = vec![(p.to_path_buf(), 0usize)];
+    let (mut seen, mut any) = (0usize, false);
+    while let Some((d, depth)) = stack.pop() {
+        // A folder it can't read, or one deeper than it looks, might have the game in it.
+        let Ok(list) = std::fs::read_dir(&d) else { return Holds::Files };
+        for e in list.flatten() {
+            seen += 1;
+            if seen > 5000 {
+                return Holds::Files;
+            }
+            let path = e.path();
+            if path.is_dir() {
+                if depth >= 4 {
+                    return Holds::Files;
+                }
+                stack.push((path, depth + 1));
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            if matches!(name.as_str(), "desktop.ini" | "thumbs.db" | ".ds_store") {
+                continue;
+            }
+            any = true;
+            let ext = path.extension().map(|x| x.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            if !NOT_A_GAME.contains(&ext.as_str()) {
+                return Holds::Files;
+            }
+        }
+    }
+    if any { Holds::OnlyMedia } else { Holds::Nothing }
+}
+
+/// A file in the top folder of an ISO 9660 disc image (PlayStation 2 and most others), in 2048-byte
+/// sectors or raw CD ones (2352 bytes, the data after a 24 or 16-byte header), which is how a
+/// PlayStation .bin keeps them.
+fn iso9660_has(path: &Path, name: &str) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    for (sector, data_at) in [(2048u64, 0u64), (2352, 24), (2352, 16)] {
+        let Some(pvd) = read_at(&mut f, 16 * sector + data_at, 2048) else { continue };
+        if &pvd[1..6] == b"CD001" {
+            return iso9660_root_has(&mut f, &pvd, sector, data_at, name);
+        }
+    }
+    false
+}
+
+/// A file in the root folder the volume descriptor `pvd` points to. The folder is read a sector at
+/// a time, since raw sectors keep each 2048 bytes of it apart.
+fn iso9660_root_has(f: &mut std::fs::File, pvd: &[u8], sector: u64, data_at: u64, name: &str) -> bool {
+    let root = &pvd[156..190];
+    let lba = u32::from_le_bytes([root[2], root[3], root[4], root[5]]) as u64;
+    let size = (u32::from_le_bytes([root[10], root[11], root[12], root[13]]) as usize).min(1 << 20);
+    let mut dir = Vec::with_capacity(size);
+    for s in 0..size.div_ceil(2048) as u64 {
+        let Some(part) = read_at(f, (lba + s) * sector + data_at, 2048) else { break };
+        dir.extend(part);
+    }
+    if dir.is_empty() {
+        return false;
+    }
+    let want = name.to_ascii_uppercase();
+    let mut i = 0;
+    while i < dir.len() {
+        let len = dir[i] as usize;
+        if len == 0 {
+            i = (i / 2048 + 1) * 2048;
+            continue;
+        }
+        if i + 33 > dir.len() {
+            break;
+        }
+        let nl = dir[i + 32] as usize;
+        if i + 33 + nl <= dir.len() {
+            let n = String::from_utf8_lossy(&dir[i + 33..i + 33 + nl]).to_ascii_uppercase();
+            if n.split(';').next() == Some(want.as_str()) {
+                return true;
+            }
+        }
+        i += len;
+    }
+    false
+}
+
+/// A file in the top folder of an Xbox 360 disc image (XDVDFS).
+/// Where an Xbox disc image's file system is, if it has one this reader (and the games) know.
+fn xdvdfs_part(path: &Path) -> Option<u64> {
+    let mut f = std::fs::File::open(path).ok()?;
+    [0u64, 0x2080000, 0xFD90000, 0x18300000].into_iter().find(|part| read_at(&mut f, part + 32 * 2048, 20).map(|d| &d[..] == b"MICROSOFT*XBOX*MEDIA").unwrap_or(false))
+}
+
+fn xdvdfs_has(path: &Path, name: &str) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let want = name.to_ascii_lowercase();
+    for part in [0u64, 0x2080000, 0xFD90000, 0x18300000] {
+        let Some(d) = read_at(&mut f, part + 32 * 2048, 28) else { continue };
+        if &d[..20] != b"MICROSOFT*XBOX*MEDIA" {
+            continue;
+        }
+        let sector = u32::from_le_bytes([d[20], d[21], d[22], d[23]]) as u64;
+        let size = (u32::from_le_bytes([d[24], d[25], d[26], d[27]]) as usize).min(1 << 20);
+        let Some(t) = read_at(&mut f, part + sector * 2048, size) else { return false };
+        let mut pos = 0;
+        while pos + 14 <= t.len() {
+            if t[pos] == 0xFF && t[pos + 1] == 0xFF {
+                pos = (pos / 2048 + 1) * 2048;
+                continue;
+            }
+            let nl = t[pos + 13] as usize;
+            if pos + 14 + nl > t.len() {
+                break;
+            }
+            if String::from_utf8_lossy(&t[pos + 14..pos + 14 + nl]).to_ascii_lowercase() == want {
+                return true;
+            }
+            pos = (pos + 14 + nl + 3) & !3;
+        }
+        return false;
+    }
+    false
+}
+
+/// A link to a folder: a junction on Windows (no administrator rights needed), a symlink elsewhere.
+/// A link (a junction on Windows, a symlink elsewhere: the dump folders `place` links in) whose
+/// target is gone. A hard-linked or copied file is a real file, never dead.
+pub fn dead_link(p: &Path) -> bool {
+    let link = p.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) || is_junction(p);
+    link && std::fs::metadata(p).is_err()
+}
+
+#[cfg(windows)]
+fn is_junction(p: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    // FILE_ATTRIBUTE_REPARSE_POINT: a junction link_dir made.
+    p.symlink_metadata().is_ok_and(|m| m.file_attributes() & 0x400 != 0)
+}
+
+#[cfg(not(windows))]
+fn is_junction(_: &Path) -> bool {
+    false
+}
+
+/// Takes a link away, never what it points to: a symlink as a file, a junction as an empty
+/// folder. Never remove_dir_all, which would follow it into the player's dump.
+fn remove_link(p: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(p).or_else(|_| std::fs::remove_dir(p))
+}
+
+fn link_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::win::junction(from, to).map_err(|e| std::io::Error::other(format!("Couldn't link {} into the game's folder: {e}", from.display())))
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(from, to)
+    }
+}
+
+/// Whether this is the player's copy the game wants. Err says why not.
+/// A copy packed in an archive (.7z, .zip, .rar) for a game that doesn't read archives itself:
+/// its kind.
+pub fn packed(g: &GameCopy, p: &Path) -> Option<String> {
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    (p.is_file() && ["7z", "zip", "rar"].contains(&ext.as_str()) && !g.name.to_lowercase().ends_with(&format!(".{ext}")) && !g.label.to_lowercase().contains(&format!(".{ext}"))).then_some(ext)
+}
+
+impl GameCopy {
+    /// The file the game is given for the player's copy. A .cue, .gdi or .m3u stands for a disc
+    /// kept as several files: a game whose label (or `name`) names that kind of file reads it, and
+    /// any other one reads single disc images, so it's given the disc's first data track (the
+    /// .bin). An .m3u for a game that names .cue or .gdi gets its first disc's sheet.
+    pub fn file_for(&self, copy: &Path) -> PathBuf {
+        let ext = copy.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        if !matches!(ext.as_str(), "cue" | "gdi" | "m3u") || self.names_kind(&ext) {
+            return copy.to_path_buf();
+        }
+        if ext == "m3u" {
+            let first = crate::roms::first_disc(copy);
+            let named = first.as_deref().and_then(Path::extension).is_some_and(|e| self.names_kind(&e.to_string_lossy().to_ascii_lowercase()));
+            if let (Some(disc), true) = (first, named) {
+                return disc;
+            }
+        }
+        let tracks = crate::roms::sheet_data_tracks(copy).unwrap_or_default();
+        tracks.into_iter().next().unwrap_or_else(|| copy.to_path_buf())
+    }
+
+    /// The label or the file name asks for this kind of file: ".cue", or "cue" as a word.
+    fn names_kind(&self, ext: &str) -> bool {
+        let label = self.label.to_ascii_lowercase();
+        let as_word = label.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == ext);
+        as_word || self.name.to_ascii_lowercase().ends_with(&format!(".{ext}"))
+    }
+
+    /// Whether its check tells this game's copy from another game's of the same console: a file
+    /// only this game has, a disc ID. "Any disc image" or "any N64 ROM" doesn't, so
+    /// it isn't used to find the game among the player's copies.
+    /// A catalog boot profile's file checks are common files (`generic`): only an ID counts there.
+    pub fn identifies(&self) -> bool {
+        self.identifies_by_contents() || self.check.ids.iter().any(|i| crate::roms::id_key(i).len() >= 3)
+    }
+
+    /// Told apart by what's in it (a file only this game has, its N64 cartridge code), not an ID.
+    pub fn identifies_by_contents(&self) -> bool {
+        self.identifies_kind(true) || self.identifies_kind(false)
+    }
+
+    /// Only checks that `check_copy` applies to this kind of input can identify it. A file
+    /// inside an extracted folder says nothing about an arbitrary package or ROM file.
+    pub fn identifies_kind(&self, folder: bool) -> bool {
+        let c = &self.check;
+        let own = |f: &str| !f.is_empty() && !COMMON_FILES.iter().any(|x| f.eq_ignore_ascii_case(x));
+        !c.nup_build_id.is_empty() || if folder {
+            !self.generic && own(&c.file)
+        } else {
+            !c.n64_id.is_empty() || (!self.generic && (own(&c.xdvdfs) || own(&c.iso9660)))
+        }
+    }
+}
+
+/// Files every game of a console has, so they can't tell one game from another.
+const COMMON_FILES: [&str; 9] = ["default.xex", "default.xbe", "eboot.bin", "param.sfo", "system.cnf", "main.npdm", "main", "main.dol", "boot.bin"];
+
+/// The copy's own ID when the game lists IDs and it isn't one of them. None when none are listed
+/// or the copy's ID can't be read.
+fn wrong_copy_id(g: &GameCopy, p: &Path) -> Option<String> {
+    let ids: Vec<String> = g.check.ids.iter().map(|i| crate::roms::id_key(i)).filter(|i| i.len() >= 3).collect();
+    if ids.is_empty() {
+        return None;
+    }
+    let id = crate::roms::copy_id(p)?;
+    let listed = ids.iter().any(|w| id.starts_with(w.as_str()));
+    (!listed).then_some(id)
+}
+
+pub fn check_copy(g: &GameCopy, p: &Path) -> Result<(), String> {
+    let folder = p.is_dir();
+    // A game packed in an archive: unpacked first (set_game_copy does that for .7z and .zip).
+    if let Some(ext) = packed(g, p) {
+        return Err(format!("That's a compressed file (.{ext}). Unpack it first with 7-Zip or Windows, then pick the game file inside it."));
+    }
+    let kind_ok = match g.kind.as_str() {
+        "folder" => folder,
+        "iso_or_folder" => folder || p.is_file(),
+        _ => p.is_file(),
+    };
+    if !kind_ok {
+        let disc = g.label.to_lowercase().contains("iso") || g.label.to_lowercase().contains("disc");
+        return Err(if !folder { "It needs the game's folder, not a file.".into() } else if disc { "It needs the disc image (.iso), not a folder.".into() } else { "It needs the file itself, not a folder.".into() });
+    }
+    if folder {
+        if !g.check.file.is_empty() && !p.join(&g.check.file).is_file() && !std::fs::read_dir(p).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(&g.check.file)) {
+            return Err(format!("That folder doesn't have {}.", g.check.file));
+        }
+        if !g.check.nup_build_id.is_empty() {
+            return check_nup_build(&g.check.nup_build_id, nup::build_id_of_folder(p));
+        }
+        // An extracted game whose ID can be read (a PlayStation game's param.sfo, an Xbox 360 game's
+        // default.xex) and isn't one of this game's. One whose ID can't be read isn't refused.
+        if let Some(id) = wrong_copy_id(g, p) {
+            return Err(format!("That folder is a different game (its ID is {id})."));
+        }
+        // With nothing more to check by: a folder with nothing in it, or only pictures and videos
+        // (the launcher's own screenshots folder, say), is never anyone's game.
+        if g.check.file.is_empty() {
+            match folder_holds(p) {
+                Holds::Nothing => return Err("That folder is empty. Pick the folder with your copy of the game.".into()),
+                Holds::OnlyMedia => return Err("That folder only has pictures, videos or documents in it. Pick the folder with your copy of the game.".into()),
+                Holds::Files => {}
+            }
+        }
+        return Ok(());
+    }
+    // A compressed disc image (.rvz, .chd...) for a recomp that reads plain ones: said now, rather
+    // than the game failing to read it. One whose label names that kind takes it. An NKit image
+    // keeps .iso at the end (Game.nkit.iso), so its name is looked at too.
+    let mut ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let lower_name = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if lower_name.ends_with(".nkit.iso") || lower_name.ends_with(".nkit.gcz") || (ext == "iso" && nkit_image(p)) {
+        ext = "nkit".into();
+    }
+    // A picture, a document or a video picked by mistake: never anyone's game.
+    if NOT_A_GAME.contains(&ext.as_str()) && !g.label.to_lowercase().contains(&format!(".{ext}")) && !g.name.to_lowercase().ends_with(&format!(".{ext}")) {
+        return Err("That's a picture, document or video, not your copy of the game. Pick the game file itself.".into());
+    }
+    // A program (the recomp's own .exe, a .dll beside it): never the player's copy, unless the copy
+    // it asks for is a program of that kind.
+    if PROGRAMS.contains(&ext.as_str()) && !g.label.to_lowercase().contains(&format!(".{ext}")) && !g.name.to_lowercase().ends_with(&format!(".{ext}")) {
+        return Err("That's a program, not your copy of the game. Pick the game file itself.".into());
+    }
+    if ["rvz", "wia", "gcz", "wbfs", "chd", "cso", "zso", "nkit"].contains(&ext.as_str()) && !g.label.to_lowercase().contains(&format!(".{ext}")) && !g.label.to_lowercase().contains(&format!("{ext} ")) {
+        // The launcher can make the plain copy itself (convert.rs): the setup offers to.
+        return Err(format!("CONVERT|That's a compressed .{ext} image, and this recomp reads plain .iso files."));
+    }
+    // A .cue, .gdi or .m3u: what's on the disc is in its data tracks, so those are what's checked.
+    // A sheet whose tracks aren't beside it is said now, rather than read as the wrong game.
+    let tracks = crate::roms::sheet_data_tracks(p);
+    if tracks.as_ref().is_some_and(Vec::is_empty) {
+        return Err(format!("The disc's track files (.bin) aren't beside that .{ext}. Keep them in the same folder, with the names it lists."));
+    }
+    let on_disc = tracks.unwrap_or_else(|| vec![p.to_path_buf()]);
+    if !g.check.iso9660.is_empty() && !on_disc.iter().any(|d| iso9660_has(d, &g.check.iso9660)) {
+        return Err("That disc image isn't the release this recomp reads.".into());
+    }
+    // A disc ID that isn't one of this game's (a copy whose ID can't be read isn't refused).
+    if let Some(id) = wrong_copy_id(g, p) {
+        return Err(format!("That's a different game's disc image (its ID is {id})."));
+    }
+    if !g.check.xdvdfs.is_empty() && !xdvdfs_has(p, &g.check.xdvdfs) {
+        return Err(if xdvdfs_part(p).is_none() {
+            "That disc image can't be read: it may be incomplete, compressed or not an Xbox disc. Use a full, uncompressed .iso of your disc.".into()
+        } else {
+            "That disc image isn't the game this recomp reads.".into()
+        });
+    }
+    if !g.check.nup_build_id.is_empty() {
+        // By the package's magic, not its name; only its headers and `main`'s first bytes are read.
+        let id = if nup::is_package(p) { nup::build_id_of_package(p) } else { Err("That isn't a Nintendo Switch .nup package.".into()) };
+        return check_nup_build(&g.check.nup_build_id, id);
+    }
+    let wants_n64 = !g.check.n64_region.is_empty() || !g.check.n64_id.is_empty() || g.check.n64_rev.is_some() || [".z64", ".n64", ".v64"].iter().any(|e| g.name.to_lowercase().ends_with(e));
+    if wants_n64 {
+        // An N64 ROM starts with one of three byte patterns; anything else isn't one.
+        let Some(h) = n64_header(p) else {
+            return Err("That isn't an N64 ROM. Pick your game's .z64, .n64 or .v64 file.".into());
+        };
+        {
+            if !g.check.n64_id.is_empty() && !h[0x3C..0x3E].eq_ignore_ascii_case(g.check.n64_id.as_bytes()) {
+                return Err("That ROM is a different game.".into());
+            }
+            let c = h[0x3E] as char;
+            if !g.check.n64_region.is_empty() && c.is_ascii_uppercase() && !g.check.n64_region.contains(c) {
+                return Err(if g.check.n64_region == "E" {
+                    "That ROM isn't the USA version, which this recomp needs.".into()
+                } else {
+                    "That ROM is from a region this recomp doesn't read.".into()
+                });
+            }
+            if let Some(rev) = g.check.n64_rev {
+                if h[0x3F] != rev {
+                    return Err("That ROM is a different version (revision) of the game than this recomp reads.".into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The build a package or folder is, against the one the recomp needs.
+fn check_nup_build(want: &str, have: Result<String, String>) -> Result<(), String> {
+    let have = have?;
+    if nup::matches(&have, want)? {
+        Ok(())
+    } else {
+        Err(format!("That copy is build {}. This recomp needs build {}.", &have[..8], want.trim().to_ascii_lowercase()))
+    }
+}
+
+/// Kinds of file that are never a game: pictures, documents, videos, shortcuts.
+const PROGRAMS: [&str; 9] = ["exe", "dll", "so", "appimage", "msi", "bat", "cmd", "sh", "pyd"];
+const NOT_A_GAME: [&str; 24] = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "avif", "tif", "tiff", "ico", "txt", "pdf", "doc", "docx", "rtf", "html", "htm", "url", "lnk", "mp4", "mkv", "avi", "mov"];
+
+/// An NKit image under a plain .iso name: NKit writes "NKIT" at 0x200 of the GameCube and Wii
+/// images it makes.
+fn nkit_image(p: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(p) else { return false };
+    read_at(&mut f, 0x200, 4).map(|b| b == b"NKIT").unwrap_or(false)
+}
+
+/// A SNES ROM whose size isn't one a full dump has (a multiple of 32 KB, plus 512 bytes when it
+/// keeps a copier's header): most likely an incomplete or damaged file. Said, never refused.
+pub fn odd_snes_size(p: &Path) -> bool {
+    let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if ext != "sfc" && ext != "smc" {
+        return false;
+    }
+    let Ok(m) = std::fs::metadata(p) else { return false };
+    let n = m.len();
+    n >= 32 * 1024 && n % 0x8000 != 0 && n % 0x8000 != 512
+}
+
+/// The byte order an N64 ROM is in: 0 for .z64 (as the console reads it), 2 for .v64 (every two
+/// bytes swapped), 4 for .n64 (every four bytes reversed). None: not an N64 ROM.
+fn n64_order(first: &[u8]) -> Option<u8> {
+    match first.get(..4)? {
+        [0x80, 0x37, 0x12, 0x40] => Some(0),
+        [0x37, 0x80, 0x40, 0x12] => Some(2),
+        [0x40, 0x12, 0x37, 0x80] => Some(4),
+        _ => None,
+    }
+}
+
+/// Bytes from any N64 ROM in .z64 order.
+pub fn n64_to_z64(b: &mut [u8], order: u8) {
+    match order {
+        2 => b.chunks_exact_mut(2).for_each(|c| c.swap(0, 1)),
+        4 => b.chunks_exact_mut(4).for_each(|c| c.reverse()),
+        _ => {}
+    }
+}
+
+/// The files a .cue, .gdi or .m3u names that sit right beside it, read by the scanner's own sheet
+/// reader (crate::roms). They're put in the game's folder under their own names, so a file in
+/// another folder, or one reached through "..", is never brought along.
+pub fn sheet_tracks(sheet: &Path) -> Vec<PathBuf> {
+    let Some(dir) = sheet.parent() else { return vec![] };
+    let files = crate::roms::sheet_files(sheet).unwrap_or_default();
+    files.into_iter().filter(|f| f.parent() == Some(dir)).collect()
+}
+
+/// An N64 ROM's first 64 bytes (its header), in .z64 order whatever order the file is in.
+fn n64_header(path: &Path) -> Option<Vec<u8>> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut h = read_at(&mut f, 0, 64)?;
+    let order = n64_order(&h)?;
+    n64_to_z64(&mut h, order);
+    Some(h)
+}
+
+/// An N64 ROM's country letter (byte 0x3E), in any of the three byte orders ROMs come in.
+#[allow(dead_code)]
+fn n64_country(path: &Path) -> Option<char> {
+    let c = n64_header(path)?[0x3E] as char;
+    c.is_ascii_uppercase().then_some(c)
+}
+
+/// A .v64 or .n64 ROM placed under a .z64 name: written out in .z64 order (a link would hand the
+/// game bytes in the wrong order: "bad N64 magic"). True when it did that.
+fn place_z64(from: &Path, to: &Path) -> std::io::Result<bool> {
+    let wants_z64 = to.extension().map(|e| e.eq_ignore_ascii_case("z64")).unwrap_or(false);
+    if !wants_z64 {
+        return Ok(false);
+    }
+    let mut f = std::fs::File::open(from)?;
+    let Some(head) = read_at(&mut f, 0, 4) else { return Ok(false) };
+    let Some(order) = n64_order(&head).filter(|o| *o != 0) else { return Ok(false) };
+    let mut b = std::fs::read(from)?;
+    n64_to_z64(&mut b, order);
+    std::fs::write(to, b)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn system_reads_each_part_and_a_profile_without_it_writes_none() {
+        let p: super::Profile = serde_json::from_str(r#"{"format":1,"system":{"linux":{"glibc":"2.35","graphics":{"vulkan":"1.3"}},"windows":{"version":"11"}}}"#).unwrap();
+        let s = p.system.as_ref().unwrap();
+        assert_eq!(s.for_build("linux").unwrap().glibc, "2.35");
+        assert_eq!(s.for_build("linux").unwrap().graphics["vulkan"], "1.3");
+        assert_eq!(s.for_build("windows").unwrap().version, "11");
+        assert!(s.for_build("macos").is_none());
+        // Setups fingerprinted from the profile before `system` existed stay set up.
+        let plain: super::Profile = serde_json::from_str(r#"{"format":1}"#).unwrap();
+        assert!(!serde_json::to_string(&plain).unwrap().contains("system"));
+    }
+
+    #[test]
+    fn easy_setup_follows_the_websites_rule() {
+        let p = |v: serde_json::Value| serde_json::from_value::<super::Profile>(v).unwrap().easy_setup();
+        assert!(p(serde_json::json!({ "start": { "program": ["Game.exe"] }, "game": {} })));
+        assert!(!p(serde_json::json!({ "game": {} })));
+        assert!(!p(serde_json::json!({ "start": { "program": ["Game.exe"] } })));
+        assert!(p(serde_json::json!({ "inputs": [{ "id": "d", "label": "Disc", "role": "disc", "formats": [{ "type": "file" }] }] })));
+        assert!(p(serde_json::json!({ "inputs": [{ "id": "g", "label": "Game", "role": "game", "formats": [{ "type": "file" }] }] })));
+        assert!(!p(serde_json::json!({ "inputs": [{ "id": "g", "label": "Game", "role": "game", "optional": true, "formats": [{ "type": "file" }] }] })));
+        assert!(!p(serde_json::json!({ "inputs": [{ "id": "k", "label": "K", "role": "key", "shared": "switch.prod-keys" }] })));
+    }
+
+    #[test]
+    fn setup_step_options_show_where_they_apply_and_add_their_args_when_ticked() {
+        let p: super::Profile = serde_json::from_str(r#"{"format":1,"prepare":{"program":["Builder.exe"],"args":["--prepare"],"options":[
+            {"id":"dlss","label":"Upscaler A","args":["--fetch-a","--accept-a"],"gpu":"nvidia","license":{"name":"A","url":"https://example.com/a"}},
+            {"id":"fsr4","label":"Upscaler B","args":["--b"],"gpu":"amd","os":["windows"],"license":{"name":"B","url":"https://example.com/b"}},
+            {"id":"hd","label":"HD textures","args":["--hd"],"unknown":"ignored"},
+            {"id":"extra","label":"Extra","args":["--x"],"default":false,"os":["linux"]},
+            {"id":"broken","label":"Broken","args":"--not-a-list"}]}}"#).unwrap();
+        let pr = p.prepare.unwrap();
+        let ids = |os: &str, rtx: bool, amd: bool| pr.options_here(os, rtx, amd).iter().map(|o| o.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids("windows", true, false), ["dlss", "hd"]);
+        assert_eq!(ids("windows", false, true), ["fsr4", "hd"]);
+        assert_eq!(ids("linux", true, false), ["dlss", "hd", "extra"]);
+        // A Steam Deck: an AMD chip on Linux.
+        assert_eq!(ids("linux", false, true), ["hd", "extra"]);
+        assert_eq!(ids("macos", false, false), ["hd"]);
+        // A license starts off; the others start on. The player's ticks win.
+        let mut picked = std::collections::BTreeMap::new();
+        assert_eq!(pr.option_args("windows", true, false, &picked), ["--hd"]);
+        picked.insert("dlss".to_string(), true);
+        picked.insert("hd".to_string(), false);
+        assert_eq!(pr.option_args("windows", true, false, &picked), ["--fetch-a", "--accept-a"]);
+        // "default": false starts off.
+        assert_eq!(pr.option_args("linux", false, false, &std::collections::BTreeMap::new()), ["--hd"]);
+        // Not on this PC: never added, whatever was ticked.
+        assert!(pr.option_args("windows", false, true, &picked).is_empty());
+    }
+
+    #[test]
+    fn a_required_option_with_a_license_starts_unticked_and_holds_setup_until_ticked() {
+        let p: super::Profile = serde_json::from_str(r#"{"format":1,"prepare":{"program":["Builder.exe"],"options":[
+            {"id":"vs","label":"Build tools","args":["--accept-vs-license"],"required":true,"default":true,"license":{"name":"VS","url":"https://example.com/vs"}}]}}"#).unwrap();
+        let pr = p.prepare.unwrap();
+        let mut picked = std::collections::BTreeMap::new();
+        // "default": true doesn't accept a license for the player.
+        let ids = |picked: &std::collections::BTreeMap<String, bool>| pr.unticked_required("windows", false, false, picked).iter().map(|o| o.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&picked), ["vs"]);
+        assert!(pr.option_args("windows", false, false, &picked).is_empty());
+        picked.insert("vs".to_string(), true);
+        assert!(ids(&picked).is_empty());
+        assert_eq!(pr.option_args("windows", false, false, &picked), ["--accept-vs-license"]);
+    }
+
+    #[test]
+    fn a_required_option_without_a_license_can_start_ticked() {
+        let p: super::Profile = serde_json::from_str(r#"{"format":1,"prepare":{"program":["Builder.exe"],"options":[
+            {"id":"tools","label":"Tools","args":["--tools"],"required":true}]}}"#).unwrap();
+        let pr = p.prepare.unwrap();
+        let mut picked = std::collections::BTreeMap::new();
+        assert!(pr.unticked_required("linux", false, false, &picked).is_empty());
+        picked.insert("tools".to_string(), false);
+        assert_eq!(pr.unticked_required("linux", false, false, &picked).len(), 1);
+    }
+
+    #[test]
+    fn a_required_option_this_pc_isnt_offered_doesnt_hold_setup() {
+        let p: super::Profile = serde_json::from_str(r#"{"format":1,"prepare":{"program":["Builder.exe"],"options":[
+            {"id":"vs","label":"Build tools","args":["--vs"],"required":true,"os":["windows"],"license":{"name":"VS","url":"https://example.com/vs"}},
+            {"id":"dlss","label":"Upscaler A","args":["--a"],"required":true,"gpu":"nvidia","default":false}]}}"#).unwrap();
+        let pr = p.prepare.unwrap();
+        // A Steam Deck: neither applies.
+        assert!(pr.unticked_required("linux", false, true, &std::collections::BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn an_option_added_after_setup_is_unanswered_until_the_player_answers_it() {
+        let p: super::Profile = serde_json::from_str(r#"{"format":1,"prepare":{"program":["Builder.exe"],"options":[
+            {"id":"hd","label":"HD textures","args":["--hd"]},
+            {"id":"dlss","label":"Upscaler A","args":["--a"],"gpu":"nvidia","license":{"name":"A","url":"https://example.com/a"}}]}}"#).unwrap();
+        let pr = p.prepare.unwrap();
+        // Set up when only "hd" existed: "dlss" came with an update.
+        let mut picked = std::collections::BTreeMap::from([("hd".to_string(), true)]);
+        let ids = |picked: &std::collections::BTreeMap<String, bool>| pr.unanswered("windows", true, false, picked).iter().map(|o| o.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&picked), ["dlss"]);
+        // Not now is an answer too.
+        picked.insert("dlss".to_string(), false);
+        assert!(ids(&picked).is_empty());
+    }
+
+    #[test]
+    fn an_option_this_pc_isnt_offered_is_never_unanswered() {
+        let p: super::Profile = serde_json::from_str(r#"{"format":1,"prepare":{"program":["Builder.exe"],"options":[
+            {"id":"dlss","label":"Upscaler A","args":["--a"],"gpu":"nvidia"}]}}"#).unwrap();
+        let pr = p.prepare.unwrap();
+        // A Steam Deck: no RTX card, so DLSS is never asked about.
+        assert!(pr.unanswered("linux", false, true, &std::collections::BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn a_program_the_player_picked_is_told_apart_from_the_one_it_starts() {
+        let p: super::Profile = serde_json::from_str(r#"{"format":1,"start":{"program":["Hopper.AppImage","HopperBuilder.exe"],"args":["--play","{home}/Games/Hopper"]},
+            "prepare":{"program":["HopperBuilder.exe"],"args":["--prepare","--game","{game}"]}}"#).unwrap();
+        use std::path::Path;
+        assert!(p.starts_program(Path::new("C:/Games/Hopper/HopperBuilder.exe")));
+        assert!(p.starts_program(Path::new("/opt/Hopper-nightly-80-x86_64.AppImage")));
+        // The game the builder made, or anything else: the player's own pick.
+        assert!(!p.starts_program(Path::new("C:/Games/Hopper/bin/hopper.exe")));
+        assert!(!p.starts_program(Path::new("/opt/HopperEditor.exe")));
+    }
+
+    #[test]
+    fn a_built_game_that_was_moved_away_is_noticed() {
+        let home = dirs::home_dir().unwrap();
+        let name = format!("rl-built-{}", std::process::id());
+        let p: super::Profile = serde_json::from_str(&format!(r#"{{"format":1,"start":{{"program":["HopperBuilder.exe"],"args":["--play","{{home}}/{name}"]}},
+            "prepare":{{"program":["HopperBuilder.exe"],"args":["--prepare"]}}}}"#)).unwrap();
+        let install = std::env::temp_dir();
+        assert_eq!(p.built_folder_missing(&install), Some(home.join(&name)));
+        std::fs::create_dir_all(home.join(&name)).unwrap();
+        assert_eq!(p.built_folder_missing(&install), None);
+        let _ = std::fs::remove_dir_all(home.join(&name));
+        // Without a build step, a folder named on the command line is the game's business.
+        let plain: super::Profile = serde_json::from_str(&format!(r#"{{"format":1,"start":{{"program":["Hopper.exe"],"args":["--data","{{home}}/{name}"]}}}}"#)).unwrap();
+        assert_eq!(plain.built_folder_missing(&install), None);
+    }
+
+    /// A builder profile that builds into `{install}/Game` and starts with `start_args`.
+    fn builds_into_install(start_args: &str) -> super::Profile {
+        let json = format!(r#"{{"format":1,"start":{{"program":["HopperBuilder.exe"],"args":[{start_args}]}},
+            "prepare":{{"program":["HopperBuilder.exe"],"args":["--prepare","--out","{{install}}/Game"]}},
+            "folders":{{"game":[{{"path":"{{install}}/Game"}}]}}}}"#);
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn a_build_folder_inside_the_install_folder_that_is_missing_is_noticed() {
+        let install = std::env::temp_dir().join(format!("rl-built-inside-{}", std::process::id()));
+        std::fs::create_dir_all(&install).unwrap();
+        let p = builds_into_install(r#""--play","{install}/Game""#);
+        let game = std::path::PathBuf::from(super::fill("{install}/Game", &install, None));
+        assert_eq!(p.built_folder_missing(&install), Some(game));
+        std::fs::create_dir_all(install.join("Game")).unwrap();
+        assert_eq!(p.built_folder_missing(&install), None);
+        let _ = std::fs::remove_dir_all(&install);
+    }
+
+    #[test]
+    fn an_install_path_that_isnt_the_build_folder_is_not_taken_for_a_build() {
+        // A release file named in `start` (its own config) isn't something the setup built.
+        let install = std::env::temp_dir().join(format!("rl-not-built-{}", std::process::id()));
+        std::fs::create_dir_all(&install).unwrap();
+        let p = builds_into_install(r#""--config","{install}/settings.ini""#);
+        assert_eq!(p.built_folder_missing(&install), None);
+        let _ = std::fs::remove_dir_all(&install);
+    }
+
+    #[test]
+    fn appimage_embedded_profile_wins_and_binds_renamed_container() {
+        use crate::appimage::tests::{image, TempDir};
+        let dir = TempDir::new();
+        let path = dir.0.join("Renamed game \u{03b1}.AppImage");
+        let raw = br#"{"format":1,"name":"Embedded game","game":{"label":"embedded"},
+            "start":{"program":["Original.AppImage"],"args":["--disc","{game}"],"env":{"MP_DISC":"{game}"}},
+            "prepare":{"program":["Original.AppImage"],"args":["--prepare"]}}"#;
+        std::fs::write(&path, image(Some(raw), backhand::compression::Compressor::Gzip)).unwrap();
+        std::fs::write(dir.0.join("recomplauncher.json"), r#"{"format":1,"game":{"label":"adjacent"}}"#).unwrap();
+        let entry = serde_json::json!({"launcher":{"format":1,"game":{"label":"catalog"}}});
+        let owned = release_profile(&dir.0).unwrap();
+        assert!(owned.embedded);
+        assert_eq!(owned.raw["name"], "Embedded game");
+        assert!(owned.location.ends_with(".AppImage!/recomplauncher.json"));
+        let profile = find_own(&dir.0, "", &entry).unwrap();
+        assert_eq!(profile.game.unwrap().label, "embedded");
+        let start = profile.start.unwrap();
+        assert_eq!(start.program, ["Renamed game \u{03b1}.AppImage"]);
+        assert_eq!(start.args, ["--disc", "{game}"]);
+        assert_eq!(start.env["MP_DISC"], "{game}");
+        assert_eq!(profile.prepare.unwrap().program, ["Renamed game \u{03b1}.AppImage"]);
+    }
+
+    #[test]
+    fn appimage_invalid_or_missing_metadata_falls_back_to_adjacent_then_catalog() {
+        use crate::appimage::tests::{image, TempDir};
+        let dir = TempDir::new();
+        let entry = serde_json::json!({"launcher":{"format":1,"game":{"label":"catalog"}}});
+        for content in [None, Some(&b"not JSON"[..]), Some(&br#"{"format":2}"#[..]),
+                        Some(&br#"{"format":1,"start":{"program":42}}"#[..])] {
+            std::fs::write(dir.0.join("game.AppImage"), image(content, backhand::compression::Compressor::Xz)).unwrap();
+            let adjacent = dir.0.join("recomplauncher.json");
+            std::fs::write(&adjacent, r#"{"format":1,"game":{"label":"adjacent"}}"#).unwrap();
+            assert_eq!(find_own(&dir.0, "", &entry).unwrap().game.unwrap().label, "adjacent");
+            assert!(!release_profile(&dir.0).unwrap().embedded);
+            std::fs::remove_file(&adjacent).unwrap();
+            assert_eq!(find_own(&dir.0, "", &entry).unwrap().game.unwrap().label, "catalog");
+        }
+    }
+
+    #[test]
+    fn appimage_replacement_is_read_without_a_stale_extracted_copy() {
+        use crate::appimage::tests::{image, TempDir};
+        let dir = TempDir::new();
+        let path = dir.0.join("game.AppImage");
+        for label in ["first", "other"] {
+            let raw = serde_json::json!({"format":1,"game":{"label":label}}).to_string();
+            std::fs::write(&path, image(Some(raw.as_bytes()), backhand::compression::Compressor::Zstd)).unwrap();
+            assert_eq!(find_own(&dir.0, "", &Value::Null).unwrap().game.unwrap().label, label);
+        }
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn appimage_multiple_containers_do_not_override_the_folder_profile() {
+        use crate::appimage::tests::{image, TempDir};
+        let dir = TempDir::new();
+        for name in ["first.AppImage", "second.AppImage"] {
+            std::fs::write(dir.0.join(name), image(Some(br#"{"format":1,"game":{"label":"embedded"}}"#),
+                                                   backhand::compression::Compressor::Gzip)).unwrap();
+        }
+        std::fs::write(dir.0.join("recomplauncher.json"), r#"{"format":1,"game":{"label":"adjacent"}}"#).unwrap();
+        assert_eq!(find_own(&dir.0, "", &Value::Null).unwrap().game.unwrap().label, "adjacent");
+    }
+
+    #[test]
+    fn appimage_plain_folders_keep_existing_fallback_order() {
+        use crate::appimage::tests::TempDir;
+        let dir = TempDir::new();
+        let entry = serde_json::json!({"launcher":{"format":1,"game":{"label":"catalog"}}});
+        assert_eq!(find_own(&dir.0, "", &entry).unwrap().game.unwrap().label, "catalog");
+        std::fs::write(dir.0.join("recomplauncher.json"), r#"{"format":1,"game":{"label":"adjacent"}}"#).unwrap();
+        assert_eq!(find_own(&dir.0, "", &entry).unwrap().game.unwrap().label, "adjacent");
+        assert!(release_profile(Path::new("")).is_none());
+    }
+
+
+    #[test]
+    fn game_data_profiles_from_the_store() {
+        use super::*;
+        let mk = |b: &str| from_boot(&serde_json::from_str::<Value>(b).unwrap()).unwrap();
+        // A flag that takes the disc's files: an image is unpacked, the folder goes after the flag.
+        let p = mk(r#"{"kind":"portable","start":"pgr4_recompiled.exe","start_is":"game","args":"--execute_unclipped_draw_vs_on_cpu --gpu_plugin=xenos","files":{"how":"flag","flag":"--game_data_root","accepts":"folder or iso","extract":"xdvdfs","contains":["default.xex"]}}"#);
+        let g = p.game.as_ref().unwrap();
+        assert_eq!((g.kind.as_str(), g.extract.as_str(), g.check.file.as_str()), ("iso_or_folder", "xdvdfs", "default.xex"));
+        assert_eq!(p.start.as_ref().unwrap().args, ["--execute_unclipped_draw_vs_on_cpu", "--gpu_plugin=xenos", "--game_data_root", "{game}"]);
+        // A folder holding only the package file is fine.
+        let p = mk(r#"{"kind":"portable","start":"NHL3on3 Launcher.bat","files":{"how":"flag","flag":"--game_data_root","accepts":"folder"}}"#);
+        let g = p.game.as_ref().unwrap();
+        assert_eq!((g.kind.as_str(), g.check.file.as_str()), ("folder", ""));
+        let d = std::env::temp_dir().join("rl-3on3-test");
+        let _ = std::fs::create_dir_all(&d);
+        std::fs::write(d.join("58410975"), b"x").unwrap();
+        assert!(check_copy(g, &d).is_ok());
+        // A file beside the program, under its own name.
+        let p = mk(r#"{"kind":"portable","start":"NBA JAM Mod Manager.exe","files":{"how":"folder","folder":".","accepts":"file"}}"#);
+        let g = p.game.as_ref().unwrap();
+        assert_eq!((g.kind.as_str(), g.name.as_str(), g.into.as_str()), ("iso", "", "."));
+        let inst = std::env::temp_dir().join("rl-openjam-test");
+        let _ = std::fs::remove_dir_all(&inst);
+        std::fs::create_dir_all(&inst).unwrap();
+        let file = d.join("0123456789ABCDEF0123456789ABCDEF0123456789");
+        std::fs::write(&file, b"pkg").unwrap();
+        p.place(&inst, Some(&file)).unwrap();
+        assert!(inst.join("0123456789ABCDEF0123456789ABCDEF0123456789").is_file());
+        assert!(check_copy(g, &d).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&inst);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_native_build_starts_its_own_region() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join("rl-test-twin");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for n in ["pd.pal.x86_64", "pd.jpn.x86_64", "pd.x86_64", "libSDL2.so", "pd.ini"] {
+            let p = d.join(n);
+            std::fs::write(&p, b"x").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(super::native_twin(&d, "pd.i686.exe").unwrap().file_name().unwrap(), "pd.x86_64");
+        assert_eq!(super::native_twin(&d, "pd.pal.i686.exe").unwrap().file_name().unwrap(), "pd.pal.x86_64");
+        assert!(super::native_twin(&d, "other.exe").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_native_build_ignores_a_leftover_windows_exe() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("rl-native-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for n in ["parasite-eve-pc.exe", "parasite-eve-pc"] {
+            let p = d.join(n);
+            std::fs::write(&p, b"x").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let p: Profile = serde_json::from_str(r#"{"format":1,"start":{"program":["parasite-eve-pc.exe"]}}"#).unwrap();
+        let picks = BTreeMap::new();
+        // A Windows build (through Proton) starts the .exe; a native build starts the native program
+        // even when the old .exe from a previous Windows install is still in the folder.
+        assert_eq!(p.command_for(&d, None, &picks, true).unwrap().0.file_name().unwrap(), "parasite-eve-pc.exe");
+        assert_eq!(p.command_for(&d, None, &picks, false).unwrap().0.file_name().unwrap(), "parasite-eve-pc");
+        // The plain call keeps the Windows-first behavior for callers that don't know the build.
+        assert_eq!(p.command(&d, None, &picks).unwrap().0.file_name().unwrap(), "parasite-eve-pc.exe");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dotnet_app_host_starts_through_the_releases_script() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("dotnet-start");
+        // The layout of Symphony Recomp's Linux release: the app host, the files that say it's a
+        // .NET one, and the run.sh that finds the player's runtime before starting it.
+        let host = d.join("sotn");
+        std::fs::write(&host, b"\x7fELF").unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(d.join("sotn.runtimeconfig.json"), b"{}").unwrap();
+        let script = d.join("run.sh");
+        std::fs::write(&script, b"#!/bin/sh\nexport DOTNET_ROOT=\"$HOME/.dotnet\"\nexec \"$DIR/sotn\" \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let p: Profile = serde_json::from_str(r#"{"format":1,"start":{"program":["sotn.exe"]}}"#).unwrap();
+        let picks = BTreeMap::new();
+        // The host alone finds no runtime; the release's script finds one and passes the profile's
+        // arguments on, so that's what Play starts.
+        assert_eq!(p.command_for(&d, None, &picks, false).unwrap().0, script);
+        // The same when the profile names the Linux host itself rather than its Windows name.
+        let by_host: Profile = serde_json::from_str(r#"{"format":1,"start":{"program":["sotn"]}}"#).unwrap();
+        assert_eq!(by_host.command_for(&d, None, &picks, false).unwrap().0, script);
+        // Without a script it's still the host.
+        std::fs::remove_file(&script).unwrap();
+        assert_eq!(p.command_for(&d, None, &picks, false).unwrap().0, host);
+        // A native build is itself, even with a run.sh beside it.
+        std::fs::write(&script, b"#!/bin/sh\nexec \"$DIR/sotn\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_file(d.join("sotn.runtimeconfig.json")).unwrap();
+        assert_eq!(p.command_for(&d, None, &picks, false).unwrap().0, host);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_build_arguments_do_not_use_leftover_windows_paths() {
+        let dir = tmp("native-arguments");
+        std::fs::write(dir.join("game.exe"), b"MZ").unwrap();
+        std::fs::write(dir.join("game"), b"\x7fELF").unwrap();
+        let copy = dir.join("disc.iso");
+        let mut p: Profile = serde_json::from_str(r#"{"format":1,"start":{"program":["game.exe"],"args":["{game}","--disc={input:disc}"]}}"#).unwrap();
+        p.input_paths.insert("disc".into(), copy.clone());
+        let picks = BTreeMap::new();
+        let windows = p.command_for(&dir, Some(&copy), &picks, true).unwrap();
+        assert_eq!(windows.0, dir.join("game.exe"));
+        assert_eq!(windows.1, vec![wine_path(&copy.to_string_lossy()), format!("--disc={}", wine_path(&copy.to_string_lossy()))]);
+        let native = p.command_for(&dir, Some(&copy), &picks, false).unwrap();
+        assert_eq!(native.0, dir.join("game"));
+        assert_eq!(native.1, vec![copy.to_string_lossy().to_string(), format!("--disc={}", copy.display())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_settings_file_with_nothing_to_set_is_not_made_empty() {
+        let dir = tmp("config-nothing-to-set");
+        let p: Profile = serde_json::from_str(r#"{"format":1,"start":{"program":["game.exe"]},
+            "config":[{"format":"ini","file":[{"path":"{install}/game.ini"}]}]}"#).unwrap();
+        p.prepare(&dir, None).unwrap();
+        assert!(!dir.join("game.ini").exists());
+    }
+
+    #[test]
+    fn a_settings_file_with_new_values_is_made_with_them() {
+        let dir = tmp("config-new-values");
+        let p: Profile = serde_json::from_str(r#"{"format":1,"start":{"program":["game.exe"]},
+            "config":[{"format":"ini","file":[{"path":"{install}/game.ini"}],"new":{"vsync":"1"}}]}"#).unwrap();
+        p.prepare(&dir, None).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("game.ini")).unwrap().trim(), "vsync = 1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_build_config_and_environment_use_the_selected_program() {
+        let dir = tmp("native-config-env");
+        std::fs::write(dir.join("game.exe"), b"MZ").unwrap();
+        std::fs::write(dir.join("game"), b"\x7fELF").unwrap();
+        let copy = dir.join("disc.iso");
+        let mut p: Profile = serde_json::from_str(r#"{"format":1,
+            "start":{"program":["game.exe"],"args":["{game}"],"env":{"GAME_DISC":"{game}","NAMED_DISC":"{input:disc}"}},
+            "config":[{"format":"json","file":[{"path":"{install}/config.json"}],"always":{"disc":"{game}"}}]
+        }"#).unwrap();
+        p.input_paths.insert("disc".into(), copy.clone());
+        let picks = BTreeMap::new();
+        p.windows_build = Some(true);
+        p.prepare(&dir, Some(&copy)).unwrap();
+        let config = || serde_json::from_slice::<Value>(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config()["disc"], wine_path(&copy.to_string_lossy()).replace('\\', "/"));
+        assert_eq!(p.env_vars(&dir, Some(&copy)), vec![("GAME_DISC".into(), wine_path(&copy.to_string_lossy())), ("NAMED_DISC".into(), wine_path(&copy.to_string_lossy()))]);
+        p.windows_build = Some(false);
+        p.prepare(&dir, Some(&copy)).unwrap();
+        assert_eq!(config()["disc"], copy.to_string_lossy().to_string());
+        assert_eq!(p.env_vars(&dir, Some(&copy)), vec![("GAME_DISC".into(), copy.to_string_lossy().to_string()), ("NAMED_DISC".into(), copy.to_string_lossy().to_string())]);
+        let native = p.command(&dir, Some(&copy), &picks).unwrap();
+        assert_eq!(native.0, dir.join("game"));
+        assert_eq!(native.1, vec![copy.to_string_lossy().to_string()]);
+        // An explicit Windows choice still overrides the installed preference.
+        let windows = p.command_for(&dir, Some(&copy), &picks, true).unwrap();
+        assert_eq!(windows.0, dir.join("game.exe"));
+        assert_eq!(windows.1, vec![wine_path(&copy.to_string_lossy())]);
+        // If only the Windows program remains, fallback arguments must suit that program.
+        std::fs::remove_file(dir.join("game")).unwrap();
+        assert!(p.through_proton(&dir));
+        assert_eq!(p.command(&dir, Some(&copy), &picks).unwrap(), windows);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_games_through_proton_get_windows_paths() {
+        assert_eq!(wine_path("/home/deck/Games/AC6/disc.iso"), r"Z:\home\deck\Games\AC6\disc.iso");
+    }
+
+    #[test]
+    fn settings_file_under_another_name() {
+        let d = std::env::temp_dir().join(format!("rl-near-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(super::near_config(&d.join("starship.cfg.json")).is_none());
+        std::fs::write(d.join("Starship2.cfg.json"), "{}").unwrap();
+        assert_eq!(super::near_config(&d.join("starship.cfg.json")), Some(d.join("Starship2.cfg.json")));
+        std::fs::write(d.join("PORT_SETTINGS.INI"), "").unwrap();
+        assert_eq!(super::near_config(&d.join("port_settings.ini")), Some(d.join("PORT_SETTINGS.INI")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    use super::*;
+
+    fn tmp(n: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rl-prof-{n}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Game.app with Info.plist naming Contents/MacOS/Game, a Mach-O program for this processor.
+    #[cfg(target_os = "macos")]
+    fn mac_app(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let contents = dir.join("Game.app/Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>Game</string></dict></plist>"#;
+        std::fs::write(contents.join("Info.plist"), plist).unwrap();
+        let cpu: u32 = if crate::assets::arch_now() == "arm64" { 0x0100000c } else { 0x01000007 };
+        let mut head = vec![0u8; 32];
+        head[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        head[4..8].copy_from_slice(&cpu.to_le_bytes());
+        head[12..16].copy_from_slice(&2u32.to_le_bytes());
+        let exe = contents.join("MacOS/Game");
+        std::fs::write(&exe, head).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mac_app_named_in_start_and_prepare_runs_its_program() {
+        let d = tmp("mac-app");
+        mac_app(&d);
+        let p: Profile = serde_json::from_str(r#"{"format":1,"start":{"program":["Game.app"]},"prepare":{"program":["Game.app"],"args":["--install"]}}"#).unwrap();
+        let inner = d.join("Game.app/Contents/MacOS/Game");
+        assert_eq!(p.prepare.as_ref().unwrap().program_in(&d), Some(inner.clone()));
+        assert_eq!(p.command_for(&d, None, &BTreeMap::new(), false).map(|c| c.0), Some(inner));
+    }
+
+    #[test]
+    fn a_program_is_a_file_and_a_folder_only_as_a_mac_app() {
+        let d = tmp("named-program");
+        std::fs::write(d.join("game.exe"), b"MZ").unwrap();
+        std::fs::create_dir_all(d.join("Game.app/Contents/MacOS")).unwrap();
+        assert_eq!(named_program(d.join("game.exe")), Some(d.join("game.exe")));
+        assert_eq!(named_program(d.join("missing.exe")), None);
+        // A folder with no Info.plist is no program, on a Mac either.
+        assert_eq!(named_program(d.join("Game.app")), None);
+    }
+
+    #[test]
+    fn the_program_inside_a_named_app_is_the_one_start_names() {
+        let p: Profile = serde_json::from_str(r#"{"format":1,"start":{"program":["Theme Park World.app"]}}"#).unwrap();
+        assert!(p.starts_program(Path::new("/Games/tpw/Theme Park World.app/Contents/MacOS/Theme Park World")));
+        assert!(!p.starts_program(Path::new("/Games/tpw/Other.app/Contents/MacOS/Theme Park World")));
+    }
+
+    #[test]
+    fn an_unpacked_appimage_starts_its_apprun() {
+        let d = tmp("apprun");
+        std::fs::write(d.join("recomplauncher.json"), r#"{"format":1,"start":{"program":["Game-x86_64.AppImage"],"args":["{game}"]},"prepare":{"program":["Game-x86_64.AppImage"],"args":["--prepare"]}}"#).unwrap();
+        // The AppImage is still there: nothing changes.
+        std::fs::write(d.join("Game-x86_64.AppImage"), b"x").unwrap();
+        std::fs::write(d.join("AppRun"), b"#!/bin/sh\n").unwrap();
+        let p = find(&d, "", &Value::Null).unwrap();
+        assert_eq!(p.start.unwrap().program, ["Game-x86_64.AppImage"]);
+        // Unpacked at install: the AppImage is gone, so AppRun starts it (and runs its setup step).
+        std::fs::remove_file(d.join("Game-x86_64.AppImage")).unwrap();
+        let p = find(&d, "", &Value::Null).unwrap();
+        assert_eq!(p.start.unwrap().program, ["AppRun"]);
+        assert_eq!(p.prepare.unwrap().program, ["AppRun"]);
+        // No AppRun either: the profile is left as it is.
+        std::fs::remove_file(d.join("AppRun")).unwrap();
+        assert_eq!(find(&d, "", &Value::Null).unwrap().start.unwrap().program, ["Game-x86_64.AppImage"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn one_of_several_unpacked_appimages_starts_from_its_own_folder() {
+        let d = tmp("apprun-own");
+        std::fs::write(d.join("recomplauncher.json"), r#"{"format":1,"start":{"program":["Game-x86_64.AppImage"]}}"#).unwrap();
+        std::fs::create_dir_all(d.join("Game-x86_64")).unwrap();
+        std::fs::write(d.join("Game-x86_64/AppRun"), b"#!/bin/sh\n").unwrap();
+        let p = find(&d, "", &Value::Null).unwrap();
+        assert_eq!(p.start.unwrap().program, ["Game-x86_64/AppRun"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn groups_advanced_settings_and_sliders_parse() {
+        let p: Profile = serde_json::from_str(r#"{"format":1,
+            "config":[{"id":"main","format":"toml","file":[{"path":"{install}/config.toml"}]}],
+            "groups":[{"id":"Advanced","advanced":true}],
+            "settings":[
+              {"id":"fs","label":"Full screen","group":"Display","choices":[{"label":"Off","set":{"Video/fullscreen":"false"}},{"label":"On","set":{"Video/fullscreen":"true"}}]},
+              {"id":"sens","label":"Mouse Sensitivity","group":"Controls","slider":{"key":"Input/mouse_sensitivity","min":0.1,"max":5,"step":0.05,"format":"%.2f"},"defaults":{"Input/mouse_sensitivity":"1.0"}},
+              {"id":"vs","label":"V-Sync","advanced":true,"choices":[{"label":"Off","set":{"Video/vsync":"false"}},{"label":"On","set":{"Video/vsync":"true"}}]},
+              {"id":"tx","label":"Texture Cache","group":"Advanced","choices":[{"label":"Off","set":{"Video/tc":"0"}},{"label":"On","set":{"Video/tc":"1"}}]},
+              {"id":"fov","label":"Field of View","in":"args","args":["--fov","{value}"],"slider":{"min":60,"max":120,"step":5,"format":"%d"}}
+            ]}"#).unwrap();
+        assert_eq!(p.settings.len(), 5);
+        let adv: Vec<bool> = p.settings.iter().map(|s| p.is_advanced(s)).collect();
+        assert_eq!(adv, vec![false, false, true, true, false]);
+        assert_eq!(p.settings[1].group, "Controls");
+        assert!(p.settings[1].choices.is_empty() && p.settings[1].slider.is_some());
+        // A command-line slider: nothing until the player moves it, then its number in {value}.
+        let mut p = p;
+        assert!(p.setting_args(Path::new("/x"), &BTreeMap::new()).is_empty());
+        assert_eq!(p.set_slider(Path::new("/x"), "fov", 93.0).unwrap(), "95");
+        p.slider_vals.insert("fov".into(), "95".into());
+        assert_eq!(p.setting_args(Path::new("/x"), &BTreeMap::new()), vec!["--fov", "95"]);
+    }
+
+    #[test]
+    fn a_slider_leaves_the_games_own_value_alone_until_moved() {
+        let d = tmp("slider");
+        let f = d.join("config.toml");
+        let text = "[Input]\nmouse_sensitivity = 1.37\ninvert = false\n";
+        std::fs::write(&f, text).unwrap();
+        let p: Profile = serde_json::from_str(r#"{"format":1,"config":[{"id":"main","format":"toml","file":[{"path":"{install}/config.toml"}]}],
+            "settings":[{"id":"sens","label":"Mouse Sensitivity","slider":{"key":"Input/mouse_sensitivity","min":0.1,"max":5,"step":0.05,"format":"%.2f"},"defaults":{"Input/mouse_sensitivity":"1.0"}}]}"#).unwrap();
+        // Off its step, set from the game's own menu: shown as it is, and reading it writes nothing.
+        assert_eq!(p.slider_now(&p.settings[0], &d).as_deref(), Some("1.37"));
+        let _ = p.current(&d, &BTreeMap::new());
+        let _ = p.kept(&d);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), text);
+        // Moved: on a step, written with its format, the rest of the file as it was.
+        assert_eq!(p.set_slider(&d, "sens", 2.4987).unwrap(), "2.50");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "[Input]\nmouse_sensitivity = 2.50\ninvert = false\n");
+        assert_eq!(p.slider_now(&p.settings[0], &d).as_deref(), Some("2.50"));
+        // A quoted value stays quoted; past the end goes to the end.
+        std::fs::write(&f, "[Input]\nmouse_sensitivity = \"1.0\"\n").unwrap();
+        assert_eq!(p.set_slider(&d, "sens", 9.0).unwrap(), "5.00");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "[Input]\nmouse_sensitivity = \"5.00\"\n");
+        // Not in the file yet: the game's default shows.
+        std::fs::write(&f, "[Input]\ninvert = false\n").unwrap();
+        assert_eq!(p.slider_now(&p.settings[0], &d).as_deref(), Some("1.0"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    const KEYS: &str = r#"{"format":1,"config":[{"id":"main","format":"ini","file":[{"path":"{install}/input.ini"}]}],
+        "settings":[{"id":"keys","label":"Keyboard & Mouse","group":"Controls","bindings":{"separator":"|","max":2,"actions":[
+            {"label":"Cross","key":"key.cross"},{"label":"L2","key":"key.l2"},{"label":"Options","key":"key.options"},{"label":"Left Stick Up","key":"key.ls_up"}]},
+            "defaults":{"key.cross":"Space","key.l2":"Mouse Right","key.options":"Escape|Return","key.ls_up":"W"}}]}"#;
+
+    #[test]
+    fn key_bindings_read_and_write_only_what_changed() {
+        let d = tmp("bindings");
+        let f = d.join("input.ini");
+        let text = "[Keys]\nkey.cross=Space\nkey.l2=Mouse Right\nkey.options=Escape|Return\nkey.ls_up=W\n";
+        std::fs::write(&f, text).unwrap();
+        let p: Profile = serde_json::from_str(KEYS).unwrap();
+        let st = &p.settings[0];
+        // Two keys on one action: two chips, in their order.
+        assert_eq!(p.bindings_now(st, &d)[2], vec!["Escape".to_string(), "Return".to_string()]);
+        assert!(!p.bindings_changed(st, &d));
+        // Reading writes nothing, and the same keys set again write nothing either.
+        let _ = p.current(&d, &BTreeMap::new());
+        assert_eq!(p.set_binding(&d, "keys", "key.options", &["Escape".into(), "Return".into()]).unwrap(), vec!["Escape", "Return"]);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), text);
+        // Mouse 4 in place of Return: only that line changes.
+        p.set_binding(&d, "keys", "key.options", &["Escape".into(), "Mouse 4".into()]).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "[Keys]\nkey.cross=Space\nkey.l2=Mouse Right\nkey.options=Escape|Mouse 4\nkey.ls_up=W\n");
+        assert!(p.bindings_changed(&p.settings[0], &d));
+        // One cleared: the rest is written.
+        p.set_binding(&d, "keys", "key.options", &["Mouse 4".into()]).unwrap();
+        assert!(std::fs::read_to_string(&f).unwrap().contains("key.options=Mouse 4\n"));
+        // No more than "max" keys.
+        assert_eq!(p.set_binding(&d, "keys", "key.cross", &["Space".into(), "E".into(), "F".into()]).unwrap(), vec!["Space", "E"]);
+        // Reset to Default: back to the game's own keys.
+        p.reset_bindings(&d, "keys").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), text);
+        // An update keeps them.
+        assert!(p.kept(&d).iter().any(|(_, k, v)| k == "key.options" && v == "Escape|Return"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn key_names_follow_the_file() {
+        let b = Bindings { separator: "|".into(), max: 2, actions: vec![], names: BTreeMap::new() };
+        // The file says Enter: Enter it is.
+        assert_eq!(b.file_name("Return", &["Enter".into(), "W".into()]), "Enter");
+        assert_eq!(b.file_name("Mouse 4", &["Space".into()]), "Mouse 4");
+        assert_eq!(b.file_name("space", &["SPACE".into()]), "SPACE");
+        // The profile's own name wins.
+        let mut names = BTreeMap::new();
+        names.insert("Enter".to_string(), "Return".to_string());
+        names.insert("Mouse 4".to_string(), "MB4".to_string());
+        let b = Bindings { names, ..b };
+        assert_eq!(b.file_name("Return", &["Enter".into()]), "Return");
+        assert_eq!(b.file_name("Mouse 4", &[]), "MB4");
+        assert_eq!(b.split("\"Escape | Return\""), vec!["Escape", "Return"]);
+        assert!(b.split("").is_empty());
+    }
+
+    #[test]
+    fn key_bindings_keep_quotes_in_toml_and_json() {
+        let d = tmp("bindings-q");
+        let f = d.join("input.toml");
+        std::fs::write(&f, "[keys]\ncross = \"Space\"\n").unwrap();
+        let p: Profile = serde_json::from_str(&KEYS.replace("\"ini\"", "\"toml\"").replace("input.ini", "input.toml").replace("\"key.cross\"}", "\"keys/cross\"}")).unwrap();
+        p.set_binding(&d, "keys", "keys/cross", &["Space".into(), "Return".into()]).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "[keys]\ncross = \"Space|Return\"\n");
+        let j = d.join("input.json");
+        std::fs::write(&j, "{\"keys\": {\"cross\": \"1\"}}").unwrap();
+        let p: Profile = serde_json::from_str(&KEYS.replace("\"ini\"", "\"json\"").replace("input.ini", "input.json").replace("\"key.cross\"}", "\"keys/cross\"}")).unwrap();
+        assert_eq!(p.bindings_now(&p.settings[0], &d)[0], vec!["1"]);
+        p.set_binding(&d, "keys", "keys/cross", &["1".into(), "2".into()]).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&j).unwrap()).unwrap();
+        assert_eq!(v["keys"]["cross"], "1|2");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_profile_without_bindings_is_read_as_before() {
+        let d = tmp("nobind");
+        std::fs::write(d.join("config.toml"), "[Display]\nfullscreen = true\n").unwrap();
+        let p: Profile = serde_json::from_str(r#"{"format":1,"config":[{"id":"main","format":"toml","file":[{"path":"{install}/config.toml"}]}],
+            "settings":[{"id":"fs","label":"Display","choices":[{"label":"Window","set":{"Display/fullscreen":"false"}},{"label":"Full Screen","set":{"Display/fullscreen":"true"}}]}]}"#).unwrap();
+        assert!(p.settings[0].bindings.is_none());
+        assert_eq!(p.current(&d, &BTreeMap::new())[0].0, 1);
+        assert!(p.bindings_now(&p.settings[0], &d).is_empty());
+        assert_eq!(p.own_value(&p.settings[0], &d), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn settings_changed_in_the_game_show_when_read_again() {
+        let d = tmp("reread");
+        let f = d.join("config.toml");
+        std::fs::write(&f, "[Display]\nscale = 1\n").unwrap();
+        let p: Profile = serde_json::from_str(r#"{"format":1,"config":[{"id":"main","format":"toml","file":[{"path":"{install}/config.toml"}]}],
+            "settings":[{"id":"scale","label":"Scale","choices":[{"label":"1x","set":{"Display/scale":"1"}},{"label":"2x","set":{"Display/scale":"2"}}]}]}"#).unwrap();
+        assert_eq!(p.current(&d, &BTreeMap::new())[0].0, 0);
+        // The game changed it in its own menu while it ran.
+        std::fs::write(&f, "[Display]\nscale = 2\n").unwrap();
+        assert_eq!(p.current(&d, &BTreeMap::new())[0].0, 1);
+        // A value that isn't one of the choices: shown as it is, never rewritten.
+        std::fs::write(&f, "[Display]\nscale = 1.5\n").unwrap();
+        assert_eq!(p.own_value(&p.settings[0], &d).as_deref(), Some("1.5"));
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "[Display]\nscale = 1.5\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn match_my_screen_is_offered_in_the_settings_format() {
+        let d = tmp("screen");
+        let f = d.join("config.toml");
+        std::fs::write(&f, "[Video]\nwidth = 1280\nheight = 720\nres = \"1280x720\"\naspect = 1.777\nmode = \"stretch\"\nshape = \"16:9\"\n").unwrap();
+        let mut p: Profile = serde_json::from_str(r#"{"format":1,"config":[{"id":"main","format":"toml","file":[{"path":"{install}/config.toml"}]}],
+            "settings":[
+              {"id":"size","label":"Resolution","choices":[{"label":"720p","set":{"Video/width":"1280","Video/height":"720"}},{"label":"1080p","set":{"Video/width":"1920","Video/height":"1080"}}]},
+              {"id":"res","label":"Resolution","choices":[{"label":"720p","set":{"Video/res":"\"1280x720\""}},{"label":"1080p","set":{"Video/res":"\"1920x1080\""}}]},
+              {"id":"aspect","label":"Aspect ratio","choices":[{"label":"16:9","set":{"Video/aspect":"1.777"}},{"label":"4:3","set":{"Video/aspect":"1.333"}}]},
+              {"id":"mode","label":"Widescreen","choices":[{"label":"Stretch","set":{"Video/mode":"stretch"}},{"label":"Hor+","set":{"Video/mode":"hor+"}}]},
+              {"id":"shape","label":"Screen","choices":[{"label":"16:9","set":{"Video/shape":"\"16:9\""}},{"label":"4:3","set":{"Video/shape":"\"4:3\""}}]},
+              {"id":"scale","label":"UI scale","choices":[{"label":"Small","set":{"Video/scale":"1.25"}},{"label":"Big","set":{"Video/scale":"1.5"}}]}
+            ]}"#).unwrap();
+        p.add_screen_choices(Some((3440, 1440)));
+        let last = |i: usize| p.settings[i].choices.last().unwrap().clone();
+        assert_eq!(last(0).label, "Match my screen \u{b7} 3440\u{d7}1440");
+        assert_eq!(last(0).set, BTreeMap::from([("Video/width".to_string(), "3440".to_string()), ("Video/height".to_string(), "1440".to_string())]));
+        assert_eq!(last(1).set["Video/res"], "\"3440x1440\"");
+        assert_eq!(last(2).set["Video/aspect"], "2.389");
+        assert_eq!(p.settings[2].screen.as_deref(), Some("21:9"));
+        assert_eq!(last(4).set["Video/shape"], "\"21:9\"");
+        // Named choices, and numbers that aren't a shape: nothing added.
+        assert_eq!(p.settings[3].choices.len(), 2);
+        assert_eq!(p.settings[5].choices.len(), 2);
+        // Picked: written in the same format; on another monitor, written again before Play.
+        p.pick(&d, "res", 2).unwrap();
+        p.pick(&d, "aspect", 2).unwrap();
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.contains("res = \"3440x1440\""), "{text}");
+        assert_eq!(p.current(&d, &BTreeMap::new())[1].0, 2);
+        let mut q: Profile = p.clone();
+        q.settings.iter_mut().for_each(|s| { if s.screen.is_some() { s.choices.pop(); s.screen = None; } });
+        q.add_screen_choices(Some((5120, 1440)));
+        assert_eq!(q.follow_screen(&d, &["res".to_string(), "aspect".to_string()]), vec!["res".to_string(), "aspect".to_string()]);
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert!(text.contains("res = \"5120x1440\"") && text.contains("aspect = 3.556"), "{text}");
+        // Nothing changed: nothing written.
+        assert!(q.follow_screen(&d, &["res".to_string()]).is_empty());
+        assert_eq!(shape_name(1920, 1200), "16:10");
+        assert_eq!(shape_name(2560, 1080), "21:9");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_ps4_folder_with_another_title_id_is_refused() {
+        let d = tmp("ps4-wrong-id");
+        let game = d.join("CUSA00035");
+        crate::roms::tests::ps4_folder(&game, "The Order: 1886", "CUSA00035");
+        let check = Check { file: "eboot.bin".into(), ids: vec!["CUSA00242".into()], ..Default::default() };
+        let need = GameCopy { kind: "folder".into(), check, ..Default::default() };
+        assert!(check_copy(&need, &game).unwrap_err().contains("CUSA00035"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_ps4_folder_with_a_listed_title_id_is_taken() {
+        let d = tmp("ps4-listed-id");
+        let game = d.join("CUSA00242");
+        crate::roms::tests::ps4_folder(&game, "Diablo III", "CUSA00242");
+        let check = Check { file: "eboot.bin".into(), ids: vec!["CUSA00243".into(), "CUSA00242".into()], ..Default::default() };
+        let need = GameCopy { kind: "folder".into(), check, ..Default::default() };
+        assert!(check_copy(&need, &game).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_folder_with_no_game_in_it_is_refused() {
+        let d = tmp("nogamefolder");
+        let need = GameCopy { kind: "folder".into(), ..Default::default() };
+        let empty = d.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(check_copy(&need, &empty).unwrap_err().contains("empty"));
+        // The launcher's screenshots: pictures only.
+        let shots = d.join("Pictures/RecompLauncher/Some Game");
+        std::fs::create_dir_all(&shots).unwrap();
+        std::fs::write(shots.join("shot 1.png"), b"png").unwrap();
+        std::fs::write(d.join("Pictures/RecompLauncher/desktop.ini"), b"[x]").unwrap();
+        assert!(check_copy(&need, &d.join("Pictures/RecompLauncher")).unwrap_err().contains("pictures"));
+        let game = d.join("game");
+        std::fs::create_dir_all(game.join("us")).unwrap();
+        std::fs::write(game.join("default.xex"), b"XEX2").unwrap();
+        assert!(check_copy(&need, &game).is_ok());
+        // Deeper than it looks: let through.
+        std::fs::create_dir_all(d.join("deep/a/b/c/d/e")).unwrap();
+        assert!(check_copy(&need, &d.join("deep")).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn copies_that_cant_be_the_game_are_refused() {
+        let d = tmp("notgame");
+        let jpg = d.join("cover.jpg");
+        std::fs::write(&jpg, b"\xff\xd8\xff\xe0 not a rom").unwrap();
+        let n64 = GameCopy { kind: "iso".into(), name: "game.z64".into(), ..Default::default() };
+        assert!(check_copy(&n64, &jpg).is_err());
+        let bin = d.join("game.bin");
+        std::fs::write(&bin, vec![0u8; 4096]).unwrap();
+        assert!(check_copy(&n64, &bin).unwrap_err().contains("N64"));
+        let disc = GameCopy { kind: "iso".into(), label: "Your disc image (.iso)".into(), ..Default::default() };
+        let nkit = d.join("Game.nkit.iso");
+        std::fs::write(&nkit, vec![0u8; 4096]).unwrap();
+        assert!(check_copy(&disc, &nkit).unwrap_err().contains("nkit"));
+        let mut b = vec![0u8; 0x400];
+        b[0x200..0x204].copy_from_slice(b"NKIT");
+        let hidden = d.join("Game.iso");
+        std::fs::write(&hidden, &b).unwrap();
+        assert!(check_copy(&disc, &hidden).is_err());
+        std::fs::write(&hidden, vec![0u8; 0x400]).unwrap();
+        assert!(check_copy(&disc, &hidden).is_ok());
+        // A SNES ROM of an odd size is said, not refused.
+        let sfc = d.join("game.smc");
+        std::fs::write(&sfc, vec![0u8; 541_184]).unwrap();
+        assert!(odd_snes_size(&sfc));
+        std::fs::write(&sfc, vec![0u8; 524_288 + 512]).unwrap();
+        assert!(!odd_snes_size(&sfc));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn numbers_are_written_printf_style() {
+        assert_eq!(printf("%.2f", 2.5), "2.50");
+        assert_eq!(printf("%d", 94.6), "95");
+        assert_eq!(printf("%g", 0.30000000000000004), "0.3");
+        assert_eq!(printf("%g", 1.0), "1");
+        assert_eq!(printf("%g", 1500000.0), "1.5e+06");
+        assert_eq!(printf("%.1fx", 1.25), "1.2x");
+        let sl = Slider { key: "k".into(), min: 0.1, max: 5.0, step: 0.05, ..Default::default() };
+        assert_eq!(sl.text(sl.snap(0.1 + 0.2)), "0.3");
+        assert_eq!(sl.text(sl.snap(-3.0)), "0.1");
+    }
+
+    #[test]
+    fn a_cue_picked_for_a_named_bin_places_its_track() {
+        let d = tmp("cuebin");
+        let disc = d.join("disc");
+        std::fs::create_dir_all(&disc).unwrap();
+        std::fs::write(disc.join("CTR (USA).bin"), vec![7u8; 4096]).unwrap();
+        std::fs::write(disc.join("CTR (USA).cue"), "FILE \"CTR (USA).bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n").unwrap();
+        let install = d.join("game");
+        std::fs::create_dir_all(&install).unwrap();
+        let b: Value = serde_json::from_str(r#"{"start":"ctr.exe","files":{"how":"folder","folder":"assets","accepts":"iso","contains":["ctr-u.bin"],"what":"Your USA Crash Team Racing disc (.bin)"}}"#).unwrap();
+        let p = from_boot(&b).unwrap();
+        p.place(&install, Some(&disc.join("CTR (USA).cue"))).unwrap();
+        assert_eq!(std::fs::metadata(install.join("assets/ctr-u.bin")).unwrap().len(), 4096);
+        assert!(!install.join("assets/CTR (USA).cue").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn empty_folders_from_the_release_get_filled() {
+        let d = tmp("emptyfold");
+        let copy = d.join("dump");
+        std::fs::create_dir_all(copy.join("exefs")).unwrap();
+        std::fs::create_dir_all(copy.join("romfs")).unwrap();
+        std::fs::write(copy.join("exefs/main"), b"x").unwrap();
+        std::fs::write(copy.join("romfs/data.arc"), b"x").unwrap();
+        let install = d.join("game");
+        std::fs::create_dir_all(install.join("targets/exefs")).unwrap();
+        std::fs::create_dir_all(install.join("targets/romfs")).unwrap();
+        let b: Value = serde_json::from_str(r#"{"start":"build/xcde_launcher.exe","files":{"how":"folder","folder":"targets","accepts":"folder","contains":["exefs","romfs"]}}"#).unwrap();
+        let p = from_boot(&b).unwrap();
+        assert!(p.already_in_place(&install).is_none());
+        assert_eq!(p.missing_after_place(&install).len(), 2);
+        p.place(&install, Some(&copy)).unwrap();
+        assert!(install.join("targets/exefs/main").is_file() && install.join("targets/romfs/data.arc").is_file());
+        assert!(p.missing_after_place(&install).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_setup_step_named_for_a_plain_appimage_finds_the_releases_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("rl-prepare-twin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let image = d.join("Hopper-nightly-4-abc123-x86_64.AppImage");
+        std::fs::write(&image, b"\x7fELF").unwrap();
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pr: Prepare = serde_json::from_value(serde_json::json!({"program": ["Hopper.AppImage", "HopperBuilder.exe"], "args": ["--prepare"]})).unwrap();
+        assert_eq!(pr.program_in(&d), Some(image.clone()));
+        // A program by its exact name is still the one taken.
+        std::fs::write(d.join("Hopper.AppImage"), b"x").unwrap();
+        assert_eq!(pr.program_in(&d), Some(d.join("Hopper.AppImage")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn boot_profiles_become_easy_setup() {
+        let b: Value = serde_json::from_str(r#"{"start":"fable2.exe","files":{"how":"flag","flag":"--game_data_root","accepts":"folder","contains":["default.xex"],"what":"Xbox 360 disc, extracted"}}"#).unwrap();
+        let p = from_boot(&b).unwrap();
+        let g = p.game.as_ref().unwrap();
+        assert_eq!((g.kind.as_str(), g.check.file.as_str(), g.generic), ("folder", "default.xex", true));
+        assert_eq!(p.start.as_ref().unwrap().args, vec!["--game_data_root", "{game}"]);
+        // Into a folder: the copy's files go there as links.
+        let d = tmp("place");
+        let copy = d.join("my copy");
+        std::fs::create_dir_all(copy.join("Media")).unwrap();
+        std::fs::write(copy.join("default.xbe"), b"x").unwrap();
+        let install = d.join("game");
+        std::fs::create_dir_all(install.join("assets")).unwrap();
+        std::fs::write(install.join("assets/README.txt"), b"put files here").unwrap();
+        let b: Value = serde_json::from_str(r#"{"start":"SCDA.exe","files":{"how":"folder","folder":"assets","accepts":"folder or iso","contains":["default.xbe","Media"]}}"#).unwrap();
+        let p = from_boot(&b).unwrap();
+        assert_eq!(p.game.as_ref().unwrap().kind, "iso_or_folder");
+        // An Xbox disc image picked for it is unpacked into the folder, and checked to be this game.
+        assert_eq!(p.game.as_ref().unwrap().extract, "xdvdfs");
+        assert_eq!(p.game.as_ref().unwrap().check.xdvdfs, "default.xbe");
+        p.place(&install, Some(&copy)).unwrap();
+        assert!(install.join("assets/default.xbe").is_file());
+        assert!(install.join("assets/Media").is_dir());
+        p.place(&install, Some(&copy)).unwrap();
+        // A ROM goes in under the name the game reads.
+        let rom = d.join("Shadows (USA).z64");
+        std::fs::write(&rom, b"rom").unwrap();
+        let b: Value = serde_json::from_str(r#"{"start":"sote.exe","files":{"how":"folder","folder":".","accepts":"file","contains":["sote.us.v1.2.z64"]}}"#).unwrap();
+        from_boot(&b).unwrap().place(&install, Some(&rom)).unwrap();
+        assert_eq!(std::fs::read(install.join("sote.us.v1.2.z64")).unwrap(), b"rom");
+        // Nothing to do for a game that asks for its copy itself.
+        assert!(from_boot(&serde_json::from_str(r#"{"start":"x.exe","files":{"how":"self"}}"#).unwrap()).is_none());
+    }
+
+    #[test]
+    fn built_in_profiles_load() {
+        let f = find(Path::new("/nope"), "HossEz/fifa-world-cup-2014-recompiled", &Value::Null).unwrap();
+        assert!(f.settings.iter().any(|s| s.id == "resolution"));
+        let s = find(Path::new("/nope"), "luckvj/streetball-revival", &Value::Null).unwrap();
+        assert_eq!(s.main_copy().unwrap().check.iso9660, "SLUS_206.51");
+    }
+
+    #[test]
+    fn dusklight_official_package_uses_the_launcher_profile() {
+        let install = tmp("dusklight");
+        let program = if cfg!(windows) {
+            "dusklight.exe"
+        } else if cfg!(target_os = "macos") {
+            "Dusklight.app/Contents/MacOS/Dusklight"
+        } else {
+            "Dusklight-v2.0.3-linux-x86_64.AppImage"
+        };
+        let executable = install.join(program);
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"").unwrap();
+        let disc = install.join("Twilight Princess.rvz");
+        std::fs::write(&disc, b"").unwrap();
+        let profile = find(&install, "twilitrealm/dusklight", &Value::Null).unwrap();
+        check_copy(&profile.main_copy().unwrap(), &disc).unwrap();
+        let picks = BTreeMap::new();
+        let (exe, args) = profile.command(&install, Some(&disc), &picks).unwrap();
+        assert_eq!(exe, executable);
+        assert_eq!(args, vec!["--dvd".to_string(), disc.to_string_lossy().into_owned()]);
+
+        let data = install.join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("config.json"), "{}").unwrap();
+        let cap = profile.settings.iter().position(|s| s.id == "fps_cap").unwrap();
+        assert!(!profile.current(&install, &picks)[cap].1);
+        profile.pick(&install, "fps", 1).unwrap();
+        assert!(profile.current(&install, &picks)[cap].1);
+        profile.pick(&install, "fps_cap", 2).unwrap();
+        assert_eq!(profile.config_file("main", &install).unwrap().get("video.maxFrameRate").as_deref(), Some("90"));
+
+        let user_root = "{appdata}";
+        assert!(profile.saves.contains(&format!("{user_root}/TwilitRealm/Dusk/states.json")));
+        let game = crate::library::Installed { path: install.clone(), ..Default::default() };
+        let portable: Vec<_> = profile.saves.into_iter().filter(|path| path.starts_with("{install}/")).collect();
+        let spots = crate::saves::spots(&portable, &[], &game);
+        let card = data.join("MemoryCardA.USA.raw");
+        let states = data.join("states.json");
+        std::fs::write(&card, b"card").unwrap();
+        std::fs::write(&states, b"[]").unwrap();
+        let app = install.join("launcher-data");
+        let backup = crate::saves::backup(&app, "dusklight", &spots, &game).unwrap().unwrap();
+        assert_eq!(backup.files, 2);
+        std::fs::remove_file(&card).unwrap();
+        std::fs::remove_file(&states).unwrap();
+        let archive = crate::saves::dir_of(&app, "dusklight", &game).join(backup.name);
+        assert_eq!(crate::saves::restore(&app, "dusklight", &archive, &spots, &game).unwrap(), 2);
+        assert_eq!(std::fs::read(card).unwrap(), b"card");
+        assert_eq!(std::fs::read(states).unwrap(), b"[]");
+        let _ = std::fs::remove_dir_all(&install);
+        // The copies sit beside the game, in its library's .backups folder.
+        let _ = std::fs::remove_dir_all(crate::backups_dir(&game));
+    }
+
+    #[test]
+    fn sections_and_top_level_keys() {
+        let d = tmp("sections");
+        let p = d.join("config.ini");
+        std::fs::write(&p, "[General]\nAutosave = 0\n\n[Graphics]\n# Fullscreen mode\nFullscreen = 0\n\n[KeyMap]\nFullscreen = Alt+Return\n").unwrap();
+        let mut f = File::open(p.clone(), "ini");
+        assert_eq!(f.get("Graphics/Fullscreen").as_deref(), Some("0"));
+        assert_eq!(f.get("KeyMap/Fullscreen").as_deref(), Some("Alt+Return"));
+        assert_eq!(f.get("graphics/Fullscreen").as_deref(), Some("0"));
+        f.set("Graphics/Fullscreen", "1");
+        f.set("Graphics/WindowScale", "2");
+        f.set("Sound/EnableAudio", "1");
+        f.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "[General]\nAutosave = 0\n\n[Graphics]\n# Fullscreen mode\nFullscreen = 1\nWindowScale = 2\n\n[KeyMap]\nFullscreen = Alt+Return\n\n[Sound]\nEnableAudio = 1\n");
+        // A key that's written out but commented is switched on where it is.
+        let v = d.join("vh.ini");
+        std::fs::write(&v, "[video]\n; Window scale\n;VH_SCALE=2\n\n[audio]\n").unwrap();
+        let mut f = File::open(v.clone(), "ini");
+        assert_eq!(f.get("video/VH_SCALE"), None);
+        f.set("video/VH_SCALE", "4");
+        f.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&v).unwrap(), "[video]\n; Window scale\nVH_SCALE=4\n\n[audio]\n");
+        // A file written `key=value` gets new keys the same way.
+        let n = d.join("tight.ini");
+        std::fs::write(&n, "resScale=1\n").unwrap();
+        let mut f = File::open(n.clone(), "ini");
+        f.set("aniso", "4");
+        f.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&n).unwrap(), "resScale=1\naniso=4\n");
+        // JSON: keys inside objects too.
+        let j = d.join("s.json");
+        std::fs::write(&j, r#"{"CVars":{"gRes":1,"x":true},"top":2}"#).unwrap();
+        let mut f = File::open(j.clone(), "json");
+        assert_eq!(f.get("CVars/gRes").as_deref(), Some("1"));
+        f.set("CVars/gRes", "2");
+        f.set("Window/Fullscreen", "true");
+        f.save().unwrap();
+        let back: Value = serde_json::from_str(&std::fs::read_to_string(&j).unwrap()).unwrap();
+        assert_eq!((back["CVars"]["gRes"].as_i64(), back["CVars"]["x"].as_bool(), back["Window"]["Fullscreen"].as_bool(), back["top"].as_i64()), (Some(2), Some(true), Some(true), Some(2)));
+        // A new top-level TOML key goes before the first table, not into it.
+        let t = d.join("game.toml");
+        std::fs::write(&t, "fullscreen = true\n\n[video]\nvsync = true\n").unwrap();
+        let mut f = File::open(t.clone(), "toml");
+        f.set("frame_rate", "\"60\"");
+        f.set("video/vsync", "false");
+        f.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&t).unwrap(), "fullscreen = true\nframe_rate = \"60\"\n\n[video]\nvsync = false\n");
+    }
+
+    #[test]
+    fn boot_settings_only_change_what_is_there() {
+        let b: Value = serde_json::from_str(r#"{"start":"game.exe","files":{"how":"self"},"settings":{
+            "config":[{"id":"main","format":"toml","file":[{"path":"{install}/game.toml"}],"always":{"evil":"1"}},{"id":"bad","format":"toml","file":[{"path":"C:/Windows/win.ini"}]}],
+            "settings":[
+              {"id":"fs","label":"Full screen","choices":[{"label":"Off","set":{"fullscreen":"false"}},{"label":"On","set":{"fullscreen":"true"}}],"defaults":{"fullscreen":"false"}},
+              {"id":"x","label":"Nowhere","in":"bad","choices":[{"label":"A","set":{"a":"1"}},{"label":"B","set":{"a":"2"}}]},
+              {"id":"w","label":"Window","in":"args","choices":[{"label":"Game's choice","args":[]},{"label":"Windowed","args":["--windowed"]}]}
+            ]}}"#).unwrap();
+        let p = from_boot(&b).unwrap();
+        assert!(p.from_boot && p.start.is_none() && p.game.is_none());
+        assert_eq!(p.settings.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec!["fs", "w"]);
+        assert_eq!(p.config.len(), 1);
+        assert!(p.config[0].always.is_empty());
+        let d = tmp("bootset");
+        // Before the game made its file: nothing is written.
+        assert!(p.waiting_for_files(&d));
+        assert!(p.pick(&d, "fs", 1).is_err());
+        assert!(!d.join("game.toml").exists());
+        std::fs::write(d.join("game.toml"), "fullscreen = false\nlog = 1\n").unwrap();
+        assert!(!p.waiting_for_files(&d));
+        p.pick(&d, "fs", 1).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("game.toml")).unwrap(), "fullscreen = true\nlog = 1\n");
+        assert!(same("1.0", "1") && same("\"4x MSAA\"", "\"4x msaa\"") && !same("2", "1"));
+        let mut picks = BTreeMap::new();
+        picks.insert("w".to_string(), 1usize);
+        assert_eq!(p.setting_args(&d, &picks), vec!["--windowed"]);
+        // An update's file comes with its defaults; the pick goes back in.
+        let kept = p.kept(&d);
+        std::fs::write(d.join("game.toml"), "fullscreen = false\nlog = 1\nnew = 2\n").unwrap();
+        p.restore(&d, &kept);
+        assert_eq!(std::fs::read_to_string(d.join("game.toml")).unwrap(), "fullscreen = true\nlog = 1\nnew = 2\n");
+        // A copy and settings together.
+        let b: Value = serde_json::from_str(r#"{"start":"g.exe","files":{"how":"flag","flag":"--game","accepts":"folder"},"settings":{"config":[],"settings":[{"id":"w","label":"W","in":"args","choices":[{"label":"A","args":[]},{"label":"B","args":["-w"]}]}]}}"#).unwrap();
+        let p = from_boot(&b).unwrap();
+        assert!(p.game.is_some() && p.start.is_some() && p.settings.len() == 1);
+    }
+
+    #[test]
+    fn rom_region_and_disc_checks() {
+        let d = tmp("region");
+        let rom = d.join("ge.z64");
+        let mut h = vec![0u8; 64];
+        h[..4].copy_from_slice(&[0x80, 0x37, 0x12, 0x40]);
+        h[0x3E] = b'P';
+        std::fs::write(&rom, &h).unwrap();
+        let b: Value = serde_json::from_str(r#"{"start":"ge.exe","files":{"how":"folder","folder":"data","accepts":"file","contains":["ge007.ntsc-final.z64"],"region":"E"}}"#).unwrap();
+        let g = from_boot(&b).unwrap().game.unwrap();
+        assert_eq!(check_copy(&g, &rom).unwrap_err(), "That ROM isn't the USA version, which this recomp needs.");
+        // The same ROM byte-swapped (.v64), from the USA.
+        let mut v = h.clone();
+        for c in v.chunks_mut(2) {
+            c.swap(0, 1);
+        }
+        v[0x3F] = b'E';
+        std::fs::write(&rom, &v).unwrap();
+        assert!(check_copy(&g, &rom).is_ok());
+        // An Xbox 360 disc image read as it is: one with no Xbox file system is turned down.
+        let b: Value = serde_json::from_str(r#"{"start":"svr.exe","files":{"how":"folder","folder":".","accepts":"iso","check_image":"xdvdfs"}}"#).unwrap();
+        let g = from_boot(&b).unwrap().game.unwrap();
+        let iso = d.join("bad.iso");
+        std::fs::write(&iso, vec![0u8; 100_000]).unwrap();
+        assert!(check_copy(&g, &iso).unwrap_err().starts_with("That disc image can't be read"));
+    }
+
+    #[test]
+    fn cue_brings_its_tracks() {
+        let d = tmp("cue");
+        std::fs::write(d.join("TS (USA).cue"), "FILE \"TS (USA).bin\" BINARY\n  TRACK 01 MODE2/2352\nFILE \"../evil.bin\" BINARY\n").unwrap();
+        std::fs::write(d.join("TS (USA).bin"), b"disc").unwrap();
+        let b: Value = serde_json::from_str(r#"{"start":"ts.exe","files":{"how":"folder","folder":".","accepts":"iso"}}"#).unwrap();
+        let p = from_boot(&b).unwrap();
+        let install = d.join("game");
+        std::fs::create_dir_all(&install).unwrap();
+        p.place(&install, Some(&d.join("TS (USA).cue"))).unwrap();
+        assert!(install.join("TS (USA).cue").is_file() && install.join("TS (USA).bin").is_file());
+    }
+
+    #[test]
+    fn gdi_brings_its_tracks() {
+        let d = tmp("gdi-place");
+        std::fs::write(d.join("game.gdi"), "2\n1 0 4 2352 track01.bin 0\n2 600 0 2352 track02.raw 0\n").unwrap();
+        std::fs::write(d.join("track01.bin"), b"data").unwrap();
+        std::fs::write(d.join("track02.raw"), b"music").unwrap();
+        let b: Value = serde_json::from_str(r#"{"start":"g.exe","files":{"how":"folder","folder":".","accepts":"iso"}}"#).unwrap();
+        let install = d.join("game");
+        std::fs::create_dir_all(&install).unwrap();
+        from_boot(&b).unwrap().place(&install, Some(&d.join("game.gdi"))).unwrap();
+        assert!(install.join("track01.bin").is_file() && install.join("track02.raw").is_file());
+    }
+
+    #[test]
+    fn a_track_in_another_folder_is_not_brought_along() {
+        let d = tmp("cue-subfolder");
+        std::fs::create_dir_all(d.join("tracks")).unwrap();
+        std::fs::write(d.join("tracks/game.bin"), b"disc").unwrap();
+        std::fs::write(d.join("game.cue"), "FILE \"tracks/game.bin\" BINARY\n  TRACK 01 MODE2/2352\n").unwrap();
+        assert!(sheet_tracks(&d.join("game.cue")).is_empty());
+    }
+
+    #[test]
+    fn rom_game_version_and_byte_order() {
+        let d = tmp("n64id");
+        let mut h = vec![0u8; 128];
+        h[..4].copy_from_slice(&[0x80, 0x37, 0x12, 0x40]);
+        h[0x3B] = b'N';
+        h[0x3C] = b'P';
+        h[0x3D] = b'D';
+        h[0x3E] = b'E';
+        h[0x3F] = 0;
+        h[100] = 0xAB;
+        let rom = d.join("pd.z64");
+        std::fs::write(&rom, &h).unwrap();
+        let b: Value = serde_json::from_str(r#"{"start":"pd.exe","files":{"how":"folder","folder":"data","accepts":"file","contains":["pd.ntsc-final.z64"],"region":"E","n64_id":"PD","n64_rev":1}}"#).unwrap();
+        let p = from_boot(&b).unwrap();
+        let g = p.game.clone().unwrap();
+        assert!(check_copy(&g, &rom).unwrap_err().contains("different version"));
+        h[0x3F] = 1;
+        std::fs::write(&rom, &h).unwrap();
+        assert!(check_copy(&g, &rom).is_ok());
+        h[0x3C] = b'G';
+        h[0x3D] = b'E';
+        std::fs::write(&rom, &h).unwrap();
+        assert_eq!(check_copy(&g, &rom).unwrap_err(), "That ROM is a different game.");
+        // A .v64 placed as .z64 comes out in .z64 order.
+        h[0x3C] = b'P';
+        h[0x3D] = b'D';
+        let mut v = h.clone();
+        v.chunks_mut(2).for_each(|c| c.swap(0, 1));
+        let vrom = d.join("pd.v64");
+        std::fs::write(&vrom, &v).unwrap();
+        assert!(check_copy(&g, &vrom).is_ok());
+        let install = d.join("game");
+        std::fs::create_dir_all(&install).unwrap();
+        p.place(&install, Some(&vrom)).unwrap();
+        assert_eq!(std::fs::read(install.join("data/pd.ntsc-final.z64")).unwrap(), h);
+    }
+
+    #[test]
+    fn shipped_settings_all_load() {
+        let all: Value = serde_json::from_str(include_str!("../boot/boot-profiles.json")).unwrap();
+        let mut n = 0;
+        for (id, b) in all.as_object().unwrap() {
+            let Some(want) = b.get("settings").and_then(|s| s.get("settings")).and_then(Value::as_array) else { continue };
+            let p = from_boot(b).unwrap_or_else(|| panic!("{id}"));
+            assert_eq!(p.settings.len(), want.len(), "{id}");
+            for st in &p.settings {
+                assert!(st.target == "args" || p.config.iter().any(|c| c.id == st.target), "{id} {}", st.id);
+            }
+            n += 1;
+        }
+        assert!(n >= 30, "{n}");
+    }
+
+    #[test]
+    fn toml_edits_keep_the_rest() {
+        let d = tmp("toml");
+        let p = d.join("a.toml");
+        std::fs::write(&p, "# comment\nfullscreen = true # mine\nname = \"x y\"\n").unwrap();
+        let mut f = File::open(p.clone(), "toml");
+        assert_eq!(f.get("fullscreen").as_deref(), Some("true"));
+        assert_eq!(f.get("name").as_deref(), Some("\"x y\""));
+        f.set("fullscreen", "false");
+        f.set("new_key", "3");
+        f.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "# comment\nfullscreen = false # mine\nname = \"x y\"\nnew_key = 3\n");
+    }
+
+    #[test]
+    fn fifa_setup_and_settings() {
+        let d = tmp("fifa");
+        std::fs::write(d.join("portable.txt"), "").unwrap();
+        std::fs::write(d.join("fifawc14.exe"), "").unwrap();
+        let p = find(&d, "HossEz/fifa-world-cup-2014-recompiled", &Value::Null).unwrap();
+        p.prepare(&d, Some(Path::new("C:\\Games\\FIFA 14.iso"))).unwrap();
+        let t = std::fs::read_to_string(d.join("fifawc14.toml")).unwrap();
+        assert!(t.contains("game_data_root = \"C:/Games/FIFA 14.iso\""), "{t}");
+        assert!(t.contains("gpu_plugin = \"xenos\""));
+        assert!(t.contains("frame_rate_floor = 60"));
+        let picks = BTreeMap::new();
+        let cur = p.current(&d, &picks);
+        let res = p.settings.iter().position(|s| s.id == "resolution").unwrap();
+        assert_eq!(cur[res].0, 0);
+        p.pick(&d, "resolution", 1).unwrap();
+        assert_eq!(p.current(&d, &picks)[res].0, 1);
+        // Window size only applies in a window.
+        let size = p.settings.iter().position(|s| s.id == "window_size").unwrap();
+        assert!(!p.current(&d, &picks)[size].1);
+        p.pick(&d, "window", 2).unwrap();
+        assert!(p.current(&d, &picks)[size].1);
+        let (exe, args) = p.command(&d, None, &picks).unwrap();
+        assert!(exe.ends_with("fifawc14.exe"));
+        assert_eq!(args, vec!["--from_launcher"]);
+    }
+
+    #[test]
+    fn streetball_command() {
+        let d = tmp("sb");
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        std::fs::write(d.join("bin").join(if cfg!(windows) { "street-game.exe" } else { "street-game" }), "").unwrap();
+        let mut p = find(&d, "luckvj/streetball-revival", &Value::Null).unwrap();
+        // As profile_of fills them in from what's picked.
+        p.input_paths.insert("game".into(), PathBuf::from("/isos/nbas2.iso"));
+        let mut picks = BTreeMap::new();
+        picks.insert("intro".to_string(), 1usize);
+        let (exe, args) = p.command(&d, Some(Path::new("/isos/nbas2.iso")), &picks).unwrap();
+        assert!(exe.parent().unwrap().ends_with("bin"));
+        assert_eq!(args, vec!["--iso", "/isos/nbas2.iso", "--no-intro"]);
+    }
+
+    #[test]
+    fn disc_checks() {
+        let d = tmp("iso");
+        // A tiny ISO 9660 image with SLUS_206.51 in its top folder.
+        let mut img = vec![0u8; 20 * 2048];
+        img[16 * 2048 + 1..16 * 2048 + 6].copy_from_slice(b"CD001");
+        let root = 16 * 2048 + 156;
+        img[root + 2..root + 6].copy_from_slice(&18u32.to_le_bytes());
+        img[root + 10..root + 14].copy_from_slice(&2048u32.to_le_bytes());
+        let name = b"SLUS_206.51;1";
+        let e = 18 * 2048;
+        img[e] = (33 + name.len()) as u8;
+        img[e + 32] = name.len() as u8;
+        img[e + 33..e + 33 + name.len()].copy_from_slice(name);
+        let iso = d.join("game.iso");
+        std::fs::write(&iso, &img).unwrap();
+        let g = GameCopy { kind: "iso".into(), label: String::new(), check: Check { iso9660: "SLUS_206.51".into(), ..Default::default() }, ..Default::default() };
+        assert!(check_copy(&g, &iso).is_ok());
+        let g2 = GameCopy { check: Check { iso9660: "SLUS_999.99".into(), ..Default::default() }, ..g.clone() };
+        assert!(check_copy(&g2, &iso).is_err());
+        assert!(check_copy(&g, &d).is_err());
+    }
+
+    /// A raw (2352-byte sector) CD track, as in a PlayStation .bin, with SLUS_000.01 in its top folder.
+    fn raw_track() -> Vec<u8> {
+        let sector = |n: usize| n * 2352 + 24;
+        let mut img = vec![0u8; 20 * 2352];
+        let pvd = sector(16);
+        img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        img[pvd + 158..pvd + 162].copy_from_slice(&18u32.to_le_bytes());
+        img[pvd + 166..pvd + 170].copy_from_slice(&2048u32.to_le_bytes());
+        let name = b"SLUS_000.01;1";
+        let e = sector(18);
+        img[e] = (33 + name.len()) as u8;
+        img[e + 32] = name.len() as u8;
+        img[e + 33..e + 33 + name.len()].copy_from_slice(name);
+        img
+    }
+
+    fn racer_copy(label: &str) -> GameCopy {
+        GameCopy { kind: "iso".into(), label: label.into(), check: Check { iso9660: "SLUS_000.01".into(), ..Default::default() }, ..Default::default() }
+    }
+
+    /// A .cue for one raw data track named `track`.
+    fn cue_for(d: &Path, track: &str) -> PathBuf {
+        let cue = d.join("game.cue");
+        std::fs::write(&cue, format!("FILE \"{track}\" BINARY\n  TRACK 01 MODE2/2352\n")).unwrap();
+        cue
+    }
+
+    #[test]
+    fn a_raw_bin_passes_an_iso9660_check() {
+        let d = tmp("raw-bin");
+        let bin = d.join("game.bin");
+        std::fs::write(&bin, raw_track()).unwrap();
+        assert!(check_copy(&racer_copy(""), &bin).is_ok());
+    }
+
+    #[test]
+    fn a_cue_is_checked_through_its_data_track() {
+        let d = tmp("cue-check");
+        std::fs::write(d.join("game.bin"), raw_track()).unwrap();
+        assert!(check_copy(&racer_copy(""), &cue_for(&d, "game.bin")).is_ok());
+    }
+
+    #[test]
+    fn a_cue_without_its_tracks_is_refused() {
+        let d = tmp("cue-no-tracks");
+        let err = check_copy(&racer_copy(""), &cue_for(&d, "game.bin")).unwrap_err();
+        assert!(err.contains("aren't beside"), "{err}");
+    }
+
+    #[test]
+    fn a_game_that_reads_single_images_is_given_a_cues_bin() {
+        let d = tmp("cue-hand-bin");
+        std::fs::write(d.join("game.bin"), raw_track()).unwrap();
+        let cue = cue_for(&d, "game.bin");
+        assert_eq!(racer_copy("Your disc image of SkyRacer (USA).").file_for(&cue), d.join("game.bin"));
+    }
+
+    #[test]
+    fn a_game_that_names_cue_is_given_the_cue() {
+        let d = tmp("cue-hand-cue");
+        std::fs::write(d.join("game.bin"), raw_track()).unwrap();
+        let cue = cue_for(&d, "game.bin");
+        assert_eq!(racer_copy("Pick the .cue file, with its .bin tracks beside it.").file_for(&cue), cue);
+    }
+
+    #[test]
+    fn the_handed_file_reaches_the_games_environment() {
+        let d = tmp("cue-env");
+        std::fs::write(d.join("game.bin"), raw_track()).unwrap();
+        let cue = cue_for(&d, "game.bin");
+        let p: Profile = serde_json::from_str(r#"{"format":1,"game":{"kind":"iso","label":"Your disc image."},"start":{"program":["skyracer"],"env":{"GAME_BIN":"{game}"}}}"#).unwrap();
+        let env = p.env_vars(&d, Some(&cue));
+        assert!(env.iter().any(|(k, v)| k == "GAME_BIN" && v.ends_with("game.bin")), "{env:?}");
+    }
+
+    #[test]
+    fn nup_build_id_checks_a_package_or_folder_by_content() {
+        let d = tmp("nupcheck");
+        let mut main = vec![0u8; 0x100];
+        main[..4].copy_from_slice(b"NSO0");
+        main[0x40..0x44].copy_from_slice(&[0xe0, 0xf3, 0xcc, 0xfa]);
+        std::fs::create_dir_all(d.join("dump").join("exefs")).unwrap();
+        std::fs::write(d.join("dump").join("exefs").join("main"), &main).unwrap();
+        let g = |id: &str| GameCopy {
+            kind: "iso_or_folder".into(),
+            label: String::new(),
+            check: Check { nup_build_id: id.into(), ..Default::default() },
+            ..Default::default()
+        };
+        assert!(check_copy(&g("e0f3ccfa"), &d.join("dump")).is_ok());
+        let e = check_copy(&g("11223344"), &d.join("dump")).unwrap_err();
+        assert!(e.contains("e0f3ccfa") && e.contains("11223344"), "{e}");
+        // The folder around it: the one inside that has exefs is named.
+        assert!(check_copy(&g("e0f3ccfa"), &d).unwrap_err().contains(&d.join("dump").display().to_string()));
+        // A file is judged by its content, whatever it is called.
+        std::fs::write(d.join("a.nup"), b"just text").unwrap();
+        assert!(check_copy(&g("e0f3ccfa"), &d.join("a.nup")).unwrap_err().contains("isn't a Nintendo Switch .nup"));
+        assert!(g("e0f3ccfa").identifies_by_contents() && g("e0f3ccfa").identifies());
+        // No check, no change: any file is still accepted.
+        assert!(check_copy(&g(""), &d.join("a.nup")).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_games_own_build_folder_is_not_a_copy() {
+        // Hookshot's and Longshot's builders keep what they built from in their output folder, in a
+        // hidden folder of their own. That's the builder's private layout, not the player's copy:
+        // handed back to the builder as its copy, it refuses it (#215). Only a real copy counts.
+        let d = tmp("nup-build-folder");
+        let mut main = vec![0u8; 0x100];
+        main[..4].copy_from_slice(b"NSO0");
+        main[0x40..0x44].copy_from_slice(&[0xe0, 0xf3, 0xcc, 0xfa]);
+        let build = d.join("Longshot");
+        std::fs::create_dir_all(build.join(".longshot_exefs")).unwrap();
+        std::fs::create_dir_all(build.join("romfs")).unwrap();
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::write(build.join(".longshot_exefs").join("main"), &main).unwrap();
+        std::fs::write(build.join("bin").join("longshot.exe"), b"").unwrap();
+        let need = GameCopy {
+            kind: "iso_or_folder".into(),
+            label: String::new(),
+            check: Check { nup_build_id: "e0f3ccfa".into(), ..Default::default() },
+            ..Default::default()
+        };
+        assert!(check_copy(&need, &build).is_err());
+        // Nor is the player pointed at it from the folder around it.
+        let around = check_copy(&need, &d).unwrap_err();
+        assert!(!around.contains(&build.display().to_string()), "{around}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn start_env_fills_in_and_keeps_out_what_it_must() {
+        let p: Profile = serde_json::from_str(r#"{"format":1,"start":{"program":["g.exe"],"env":{"SDL_GAMECONTROLLER_USE_BUTTON_LABELS":"0","GAME_DATA":"{install}/data","PATH":"x","RECOMPLAUNCHER_MODE":"y","1BAD":"z"}}}"#).unwrap();
+        let e = p.env_vars(Path::new("/games/x"), None);
+        assert!(e.contains(&("SDL_GAMECONTROLLER_USE_BUTTON_LABELS".to_string(), "0".to_string())));
+        assert!(e.iter().any(|(k, v)| k == "GAME_DATA" && v.ends_with("data") && v.contains("games")));
+        assert_eq!(e.len(), 2, "PATH, the launcher's own and bad names stay out: {e:?}");
+        assert!(env_name_ok("_X1") && !env_name_ok("A-B") && !env_name_ok("path"));
+    }
+
+    #[test]
+    fn data_fills_in_as_the_recompdata_folder_in_the_game() {
+        let install = Path::new("/games/x");
+        assert_eq!(PathBuf::from(fill("{data}", install, None)), install.join("recompdata"));
+        assert_eq!(PathBuf::from(fill("{data}/cache", install, None)), install.join("recompdata").join("cache"));
+    }
+
+    #[test]
+    fn prepare_env_fills_in_and_keeps_out_what_it_must() {
+        let p: Profile = serde_json::from_str(r#"{"format":1,"prepare":{"program":["b.exe"],"env":{"BUILD_CACHE":"{data}/cache","DISC":"{game}","TEMP":"x","RECOMPLAUNCHER_DATA":"y"}}}"#).unwrap();
+        let pr = p.prepare.unwrap();
+        let e = pr.env_vars(Path::new("/games/x"), Some(Path::new("/isos/x.iso")));
+        let get = |k: &str| e.iter().find(|(n, _)| n == k).map(|(_, v)| PathBuf::from(v));
+        assert_eq!(get("BUILD_CACHE"), Some(Path::new("/games/x").join("recompdata").join("cache")));
+        assert_eq!(get("DISC"), Some(PathBuf::from("/isos/x.iso")));
+        assert_eq!(e.len(), 2, "TEMP and the launcher's own names stay out: {e:?}");
+    }
+
+    #[test]
+    fn prepare_env_run_again_without_the_copy_leaves_out_what_names_it() {
+        let p: Profile = serde_json::from_str(r#"{"format":1,"prepare":{"program":["b.exe"],"keeps_copy":true,"env":{"BUILD_CACHE":"{data}/cache","DISC":"{game}"}}}"#).unwrap();
+        let e = p.prepare.unwrap().env_vars(Path::new("/games/x"), None);
+        let names: Vec<&str> = e.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["BUILD_CACHE"]);
+    }
+
+    #[test]
+    fn prepare_env_takes_named_inputs_and_drops_a_missing_one() {
+        let p: Profile = serde_json::from_str(r#"{"format":1,"prepare":{"program":["b.exe"],"env":{"PATCH":"{input:patch}","DLC":"{input:dlc}"}}}"#).unwrap();
+        let given = BTreeMap::from([("patch".to_string(), PathBuf::from("/files/patch.zip"))]);
+        let pr = p.prepare.unwrap().with_inputs(&given, false);
+        let e = pr.env_vars(Path::new("/games/x"), None);
+        assert_eq!(e, vec![("PATCH".to_string(), "/files/patch.zip".to_string())]);
+    }
+
+    #[test]
+    fn a_prepare_without_env_writes_none() {
+        // Setups fingerprinted from the profile before prepare.env existed stay set up.
+        let p: Profile = serde_json::from_str(r#"{"format":1,"prepare":{"program":["b.exe"]}}"#).unwrap();
+        assert!(!serde_json::to_string(&p.prepare.unwrap()).unwrap().contains("env"));
+    }
+}
+
+#[cfg(test)]
+mod build_here_tests {
+    use super::*;
+
+    fn prof(v: serde_json::Value) -> Profile {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_build_already_made_plays_without_the_copy() {
+        let dir = std::env::temp_dir().join(format!("rl-b51-built-{}", std::process::id()));
+        let game = dir.join("Games").join("Hopper");
+        std::fs::create_dir_all(&game).unwrap();
+        let done = game.join("hopper_prepared.bin");
+        let base = serde_json::json!({
+            "game": { "kind": "iso_or_folder", "label": "Your copy" },
+            "prepare": { "program": ["HopperBuilder.exe"], "args": ["--prepare", "--game", "{game}"], "done": [done.to_string_lossy()] },
+            "start": { "program": ["Hopper.exe"], "args": ["--play", game.to_string_lossy()] },
+            "folders": { "game": [{ "path": game.to_string_lossy() }] }
+        });
+        let p = prof(base.clone());
+        assert_eq!(p.build_done(&dir), Some(false), "one done file missing asks for the copy");
+        std::fs::write(&done, b"x").unwrap();
+        assert_eq!(p.build_done(&dir), Some(true));
+        assert!(!p.start_uses_game());
+        // A start that hands the game the copy still asks for it.
+        let mut v = base.clone();
+        v["start"]["args"] = serde_json::json!(["--disc", "{game}"]);
+        assert!(prof(v).start_uses_game());
+        let mut v = base.clone();
+        v["start"]["env"] = serde_json::json!({ "DISC": "{game}" });
+        assert!(prof(v).start_uses_game());
+        // One path for done works too.
+        let mut v = base.clone();
+        v["prepare"]["done"] = serde_json::json!(done.to_string_lossy());
+        assert_eq!(prof(v).prepare.unwrap().done.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `game` read as named inputs: every rule it had lands on the input it becomes, so the same code
+/// checks, unpacks and places it as before.
+#[cfg(test)]
+mod lift_tests {
+    use super::*;
+
+    /// The rules of a copy, as one value: what `game` had, or what an input gives back.
+    fn rules(g: &GameCopy) -> Value {
+        serde_json::json!({
+            "kind": g.kind, "label": g.label, "check": serde_json::to_value(&g.check).unwrap(), "dumps": serde_json::to_value(&g.dumps).unwrap(),
+            "into": g.into, "name": g.name, "extract": g.extract, "generic": g.generic, "for_setup": g.for_setup, "contains": g.contains,
+        })
+    }
+
+    /// Lifts one profile and checks it: `game` gone, an input `game` first with the same rules,
+    /// `game.update` as input `update` with the same rules, everything else as it was.
+    fn lifts_the_same(what: &str, p: &Profile) {
+        let Some(before) = p.game.clone() else { return };
+        let mut after = p.clone();
+        after.lift_game();
+        assert!(after.game.is_none(), "{what}: game still there");
+        let game = after.inputs.iter().find(|i| i.id == "game").unwrap_or_else(|| panic!("{what}: no input game"));
+        assert_eq!(rules(&game.as_copy()), rules(&before), "{what}: the copy's rules changed");
+        assert_eq!(after.main_input().map(|i| i.id.as_str()), Some("game"), "{what}: game isn't the main input");
+        if let Some(up) = before.update.as_ref() {
+            let lifted = after.inputs.iter().find(|i| i.id == "update").unwrap_or_else(|| panic!("{what}: no input update")).as_extra();
+            assert_eq!(serde_json::to_value(&lifted).unwrap(), serde_json::to_value(up).unwrap(), "{what}: the update's rules changed");
+        }
+        let start = |p: &Profile| serde_json::to_value(&p.start).unwrap();
+        let prepare = |p: &Profile| serde_json::to_value(&p.prepare).unwrap();
+        assert_eq!(start(&after), start(p), "{what}: start changed");
+        assert_eq!(prepare(&after), prepare(p), "{what}: prepare changed");
+        let own: Vec<&str> = after.inputs.iter().filter(|i| !i.lifted).map(|i| i.id.as_str()).collect();
+        let was: Vec<&str> = p.inputs.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(own, was, "{what}: the manifest's own inputs changed");
+        let ok_before = crate::inputs::validate(p).is_ok();
+        assert!(crate::inputs::validate(&after).is_ok() || !ok_before, "{what}: valid before, not after: {:?}", crate::inputs::validate(&after));
+    }
+
+    fn boot_profiles(all: &Value) -> Vec<(String, Profile)> {
+        let mut out = vec![];
+        let apps: Vec<(String, Value)> = match all.get("apps").and_then(Value::as_array) {
+            Some(list) => list.iter().map(|a| (a.get("id").and_then(Value::as_str).unwrap_or("?").to_string(), a.get("boot").cloned().unwrap_or(Value::Null))).collect(),
+            None => all.as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
+        };
+        for (id, b) in apps {
+            if let Some(p) = from_boot(&b) {
+                out.push((id, p));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_shipped_boot_profiles_lift_with_every_rule() {
+        let all: Value = serde_json::from_str(include_str!("../boot/boot-profiles.json")).unwrap();
+        let list = boot_profiles(&all);
+        assert!(list.iter().filter(|(_, p)| p.game.is_some()).count() > 20);
+        for (id, p) in &list {
+            lifts_the_same(id, p);
+        }
+    }
+
+    #[test]
+    fn the_examples_lift_with_every_rule() {
+        for (n, text) in BUILT_IN.iter().enumerate() {
+            let p: Profile = serde_json::from_str(text).unwrap();
+            lifts_the_same(&format!("built-in {n}"), &p);
+        }
+    }
+
+    /// The developers' manifests and the store's catalog (`RL_CORPUS`: a folder with `manifests/`
+    /// and `pc-catalog.json`), kept out of the repository. Every one with `game` lifts the same,
+    /// and none that read before fails to read now.
+    #[test]
+    fn the_corpus_lifts_with_every_rule() {
+        let Some(root) = std::env::var_os("RL_CORPUS").map(PathBuf::from) else { return };
+        let mut lifted = 0;
+        let mut unreadable = 0;
+        for e in std::fs::read_dir(root.join("manifests")).unwrap().flatten() {
+            let what = e.file_name().to_string_lossy().to_string();
+            let Ok(raw) = serde_json::from_slice::<Value>(&std::fs::read(e.path()).unwrap()) else { continue };
+            // One that doesn't read is dropped by every launcher alike (a value of the wrong type):
+            // dropping deny_unknown_fields only lets more read, never fewer.
+            let p = match serde_json::from_value::<Profile>(raw) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{what}: doesn't read: {e}");
+                    unreadable += 1;
+                    continue;
+                }
+            };
+            if p.game.is_some() {
+                lifted += 1;
+            }
+            lifts_the_same(&what, &p);
+        }
+        assert!(lifted >= 170, "only {lifted} manifests with game");
+        assert!(unreadable <= 2, "{unreadable} manifests don't read");
+        let cat: Value = serde_json::from_slice(&std::fs::read(root.join("pc-catalog.json")).unwrap()).unwrap();
+        let store = boot_profiles(&cat);
+        let copies = store.iter().filter(|(_, p)| p.game.is_some()).count();
+        assert!(copies >= 200, "only {copies} store profiles with a copy");
+        for (id, p) in &store {
+            lifts_the_same(id, p);
+        }
+    }
+
+    #[test]
+    fn an_unknown_input_field_is_ignored() {
+        let p: Profile = serde_json::from_value(serde_json::json!({ "format": 1, "inputs": [{ "id": "base", "label": "Base", "formats": [{ "type": "file", "future": 1 }], "future": true }] })).unwrap();
+        assert_eq!(p.inputs[0].id, "base");
+        assert!(crate::inputs::validate(&p).is_ok());
+    }
+
+    #[test]
+    fn an_input_the_manifest_declares_as_game_stays_its_own() {
+        let mut p: Profile = serde_json::from_value(serde_json::json!({ "format": 1, "game": { "kind": "folder", "label": "Old" }, "inputs": [{ "id": "game", "label": "Mine", "formats": [{ "type": "file" }] }] })).unwrap();
+        p.lift_game();
+        assert_eq!(p.inputs.len(), 1);
+        assert_eq!(p.inputs[0].label, "Mine");
+    }
+
+    #[test]
+    fn the_main_input_fills_in_as_the_game_is_given_it() {
+        let d = std::env::temp_dir().join(format!("rl-main-handed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("Game (USA).cue"), "FILE \"Game (USA).bin\" BINARY\n  TRACK 01 MODE2/2352\n").unwrap();
+        std::fs::write(d.join("Game (USA).bin"), b"disc").unwrap();
+        let mut p: Profile = serde_json::from_value(serde_json::json!({ "format": 1, "game": { "kind": "iso", "label": "Your disc" }, "start": { "program": ["g"], "args": ["--disc={input:game}"] } })).unwrap();
+        p.lift_game();
+        let mut g = crate::library::Installed { path: d.join("install"), ..Default::default() };
+        g.setup_inputs.insert("game".into(), d.join("Game (USA).cue"));
+        // Its label doesn't name .cue: the game gets the disc's data track, as with {game}.
+        assert_eq!(crate::inputs::available(&p, &g, &d)["game"], d.join("Game (USA).bin"));
+        p.inputs[0].label = "Pick the .cue file".into();
+        assert_eq!(crate::inputs::available(&p, &g, &d)["game"], d.join("Game (USA).cue"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_input_can_have_every_rule_game_had() {
+        let p: Profile = serde_json::from_value(serde_json::json!({ "format": 1, "inputs": [{
+            "id": "disc", "label": "Your disc", "formats": [{ "type": "file" }, { "type": "folder" }],
+            "check": { "iso9660": "SLUS_206.51" }, "dumps": [{ "name": "USA", "crc32": "0011aabb" }],
+            "contains": ["SYSTEM.CNF"], "into": "game", "extract": "iso9660"
+        }]})).unwrap();
+        let g = p.inputs[0].as_copy();
+        assert_eq!((g.kind.as_str(), g.check.iso9660.as_str(), g.dumps.len(), g.into.as_str(), g.extract.as_str()), ("iso_or_folder", "SLUS_206.51", 1, "game", "iso9660"));
+        assert_eq!(g.contains, ["SYSTEM.CNF"]);
+        assert_eq!(p.main_input().unwrap().id, "disc");
+    }
+}
+
+/// A dump the player moved or deleted leaves a link in the game's folder that points nowhere: it
+/// counts as missing, and the next place puts the copy picked now there instead.
+#[cfg(test)]
+mod dead_link_tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rl-dead-link-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn folder_copy() -> Profile {
+        let input = serde_json::json!({ "id": "game", "label": "Your copy", "formats": [{ "type": "folder" }], "into": "data", "contains": ["Media"] });
+        serde_json::from_value(serde_json::json!({ "format": 1, "inputs": [input], "start": { "program": ["g"] } })).unwrap()
+    }
+
+    /// A dump with its Media folder, linked into the game's data folder as place does.
+    fn linked(d: &Path, name: &str) -> PathBuf {
+        let dump = d.join(name);
+        std::fs::create_dir_all(dump.join("Media")).unwrap();
+        std::fs::write(dump.join("Media").join("a.bin"), name).unwrap();
+        dump
+    }
+
+    #[test]
+    fn a_link_to_a_dump_that_is_gone_counts_as_missing_and_is_placed_again() {
+        let d = dir("gone");
+        let install = d.join("game");
+        std::fs::create_dir_all(&install).unwrap();
+        let p = folder_copy();
+        let old = linked(&d, "old-dump");
+        p.place(&install, Some(&old)).unwrap();
+        assert!(p.missing_after_place(&install).is_empty());
+        std::fs::remove_dir_all(&old).unwrap();
+        let media = install.join("data").join("Media");
+        assert!(dead_link(&media));
+        assert_eq!(p.missing_after_place(&install), vec!["Media".to_string()]);
+        assert!(p.already_in_place(&install).is_none());
+        // Picked again from where it is now: placed, not skipped.
+        let new = linked(&d, "new-dump");
+        p.place(&install, Some(&new)).unwrap();
+        assert!(p.missing_after_place(&install).is_empty());
+        assert_eq!(std::fs::read(media.join("a.bin")).unwrap(), b"new-dump");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_working_link_and_a_folder_the_launcher_didnt_place_stay() {
+        let d = dir("stay");
+        let install = d.join("game");
+        let own = install.join("data").join("Media");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("mine.bin"), b"the player's").unwrap();
+        let p = folder_copy();
+        let dump = linked(&d, "dump");
+        p.place(&install, Some(&dump)).unwrap();
+        // Not a link: never taken away, whatever's picked.
+        assert!(!dead_link(&own));
+        assert_eq!(std::fs::read(own.join("mine.bin")).unwrap(), b"the player's");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn taking_a_dead_link_away_leaves_what_it_pointed_to() {
+        let d = dir("remove");
+        let install = d.join("game");
+        std::fs::create_dir_all(&install).unwrap();
+        let p = folder_copy();
+        let dump = linked(&d, "dump");
+        p.place(&install, Some(&dump)).unwrap();
+        let media = install.join("data").join("Media");
+        // A link that still works is no dead link, and the dump is left as it is.
+        assert!(!dead_link(&media));
+        remove_link(&media).unwrap();
+        assert!(dump.join("Media").join("a.bin").is_file());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A Windows-only game's setup step on Linux runs through Proton, as its game does.
+#[cfg(all(test, not(windows)))]
+mod proton_step_tests {
+    use super::*;
+
+    #[test]
+    fn a_windows_setup_program_runs_through_proton_with_windows_paths() {
+        let d = std::env::temp_dir().join(format!("rl-proton-step-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("Builder.exe"), b"MZ").unwrap();
+        std::fs::write(d.join("builder.sh"), b"#!/bin/sh").unwrap();
+        let step = |program: &str| Prepare { program: vec![program.into()], args: vec!["--disc={input:disc}".into()], ..Default::default() };
+        assert!(step("Builder.exe").through_proton(&d));
+        assert!(!step("builder.sh").through_proton(&d));
+        // Not in the release: nothing to run through anything.
+        assert!(!step("Missing.exe").through_proton(&d));
+        let paths = BTreeMap::from([("disc".to_string(), PathBuf::from("/home/me/Games/disc.iso"))]);
+        assert_eq!(step("Builder.exe").with_inputs(&paths, true).args, [r"--disc=Z:\home\me\Games\disc.iso"]);
+        assert_eq!(step("builder.sh").with_inputs(&paths, false).args, ["--disc=/home/me/Games/disc.iso"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

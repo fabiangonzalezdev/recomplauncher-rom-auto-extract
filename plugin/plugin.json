@@ -1,0 +1,10 @@
+{
+  "id": "rom-auto-extract",
+  "name": "ROM Auto Extract",
+  "version": "1.0.0",
+  "description": "Extrae ROMs locales ZIP, RAR y 7z y selecciona la copia extraída al preparar el juego. Requiere soporte rom.unpack en RecompLauncher.",
+  "icon": "icon.svg",
+  "page": { "title": "Extraer ROMs", "entry": "index.html", "icon": "icon.svg" },
+  "permissions": ["rom.unpack"],
+  "min_launcher": "0.90.0-beta.68"
+}

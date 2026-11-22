@@ -1,0 +1,740 @@
+//! Which file of a GitHub release is the build for this PC.
+//!
+//! The catalog names one file per system as a pattern (`Zelda64Recompiled-*-Windows.zip`). That's the
+//! first choice, as long as it's built for this processor. When the pattern matches nothing (a project
+//! renamed its files) or only a build for another processor, every file of the release is scored by
+//! what its name says: the system, the processor and the kind of file.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Asset {
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub digest: Option<String>,
+    pub browser_download_url: String,
+    /// GitHub's API address for the same file (the release info has it): a second way to download
+    /// it when github.com's own download link keeps failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+pub fn os_now() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
+pub fn arch_now() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x64"
+    }
+}
+
+/// `*` any run of characters, `?` one; letter case doesn't matter.
+pub fn wild(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    let (mut pi, mut ni, mut star, mut mark) = (0usize, 0usize, None::<usize>, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// The words in a file name: `Zelda64Recompiled-v1.2.2-Linux-X64.zip` -> zelda64recompiled, v1, 2, 2, linux, x64, zip.
+fn words(name: &str) -> Vec<String> {
+    // "x86_64" and "x86-64" are one word (64-bit), not "x86" (32-bit) and "64".
+    name.to_lowercase()
+        .replace("x86_64", "x64")
+        .replace("x86-64", "x64")
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+const OS_WORDS: [(&str, &[&str]); 3] = [
+    ("windows", &["windows", "win", "win64", "win32", "win10", "msvc", "pc"]),
+    ("linux", &["linux", "appimage", "ubuntu", "debian", "steamdeck", "deck", "x86_64"]),
+    ("macos", &["macos", "mac", "osx", "darwin", "apple", "dmg", "universal"]),
+];
+const ARM64: [&str; 3] = ["arm64", "aarch64", "arm"];
+const ARM32: [&str; 7] = ["armhf", "armhfp", "armel", "armv6", "armv7", "armv7l", "armv7hl"];
+const X64: [&str; 5] = ["x64", "x86_64", "amd64", "win64", "64bit"];
+
+/// What kind of file it is, by its ending, and whether this system can use it as a build.
+pub fn kind(name: &str) -> Option<&'static str> {
+    let n = name.to_lowercase();
+    for (end, k) in [(".tar.gz", "tar.gz"), (".tgz", "tar.gz"), (".tar.xz", "tar.xz"), (".txz", "tar.xz"), (".tar.zst", "tar.zst"), (".tzst", "tar.zst"), (".zip", "zip"), (".7z", "7z"), (".rar", "rar"), (".appimage", "appimage"), (".exe", "exe"), (".msi", "msi"), (".dmg", "dmg")] {
+        if n.ends_with(end) {
+            return Some(k);
+        }
+    }
+    None
+}
+
+fn usable(os: &str, k: &str) -> bool {
+    match os {
+        "windows" => matches!(k, "zip" | "7z" | "rar" | "exe" | "msi"),
+        "linux" => matches!(k, "appimage" | "tar.gz" | "tar.xz" | "tar.zst" | "zip" | "7z" | "rar"),
+        "macos" => matches!(k, "zip" | "dmg" | "rar" | "7z"),
+        _ => false,
+    }
+}
+
+/// A file this system can use as a build: by its kind, and a .tar.gz on Windows only when its name
+/// says it's for Windows (tmc-multi-windows-x86_64-v1.tar.gz).
+fn usable_file(os: &str, name: &str) -> bool {
+    match kind(name) {
+        Some(k) if usable(os, k) => true,
+        Some("tar.gz" | "tar.xz" | "tar.zst") if os == "windows" => words(name).iter().any(|w| matches!(w.as_str(), "windows" | "win" | "win64" | "win32")),
+        _ => false,
+    }
+}
+
+/// Files that are never the game: debug symbols, sources, checksums, signatures.
+fn not_a_build(name: &str) -> bool {
+    let w = words(name);
+    let n = name.to_lowercase();
+    n.ends_with(".sha256") || n.ends_with(".sig") || n.ends_with(".asc") || n.ends_with(".pdb")
+        || w.iter().any(|x| matches!(x.as_str(), "symbols" | "pdb" | "debug" | "dbg" | "source" | "sources" | "src"))
+        || dependency(&n, &w)
+}
+
+/// A compiler, SDK or library a release keeps for building the game (a "deps" mirror):
+/// llvm-mingw-20261006-ucrt-x86_64.zip, SDL3-devel-3.4.18-mingw.tar.gz, FidelityFX-SDK-v2.4.0.zip.
+fn dependency(n: &str, w: &[String]) -> bool {
+    ["llvm-mingw", "mingw-w64", "msys2-", "w64devkit", "vulkansdk", "vulkan-sdk", "fidelityfx-sdk", "dxsdk", "winlibs-"].iter().any(|p| n.starts_with(p))
+        || w.iter().any(|x| matches!(x.as_str(), "devel" | "toolchain" | "toolchains"))
+}
+
+/// Words that tag a file as a build for a console or a phone: never a build for a PC.
+const PLATFORM_TAGS: [&str; 20] = ["switch", "switch2", "nx", "nsp", "xci", "nro", "android", "apk", "aab", "ios", "ipa", "ps4", "ps5", "vita", "psp", "3ds", "wiiu", "wii", "xbox", "vpk"];
+/// Files for a console or a phone by their ending.
+const PLATFORM_ENDS: [&str; 7] = [".apk", ".ipa", ".nsp", ".xci", ".nro", ".vpk", ".pkg"];
+
+/// A file built for a console or a phone (Game-0.5.3.1-switch.zip, Game-1.0-android-arm64.apk),
+/// never a build for this PC. Only the words after the version count: a game's own name can have
+/// console words in it ("Xbox 360", "Wii"), and with no version to go by the file is left in.
+fn for_other_platform(name: &str) -> bool {
+    let n = name.to_lowercase();
+    if PLATFORM_ENDS.iter().any(|e| n.ends_with(e)) {
+        return true;
+    }
+    static VERSION: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    let re = VERSION.get_or_init(|| regex_lite::Regex::new(r"(?:^|[^a-z0-9])v?\d+(?:\.\d+)+|(?:^|[^a-z0-9])v\d+").unwrap());
+    let Some(m) = re.find(&n) else { return false };
+    words(&n[m.end()..]).iter().any(|w| PLATFORM_TAGS.contains(&w.as_str()))
+}
+
+/// Built for another processor than this one?
+fn other_arch(name: &str, arch: &str) -> bool {
+    let w = words(name);
+    let has = |list: &[&str]| w.iter().any(|x| list.contains(&x.as_str()));
+    if has(&ARM32) {
+        return true;
+    }
+    match arch {
+        "arm64" => has(&X64) && !has(&ARM64),
+        _ => has(&ARM64) && !has(&X64),
+    }
+}
+
+fn other_os(name: &str, os: &str) -> bool {
+    let w = words(name);
+    OS_WORDS.iter().any(|(o, list)| *o != os && w.iter().any(|x| list.contains(&x.as_str()) && !(*o == "linux" && x == "x86_64")))
+        && !OS_WORDS.iter().any(|(o, list)| *o == os && w.iter().any(|x| list.contains(&x.as_str())))
+}
+
+fn score(name: &str, os: &str, arch: &str) -> i32 {
+    let k = match kind(name) {
+        Some(k) if usable_file(os, name) => k,
+        _ => return i32::MIN,
+    };
+    if not_a_build(name) || other_arch(name, arch) || other_os(name, os) || for_other_platform(name) {
+        return i32::MIN;
+    }
+    let w = words(name);
+    let mut s = 0;
+    if let Some((_, list)) = OS_WORDS.iter().find(|(o, _)| *o == os) {
+        if w.iter().any(|x| list.contains(&x.as_str())) {
+            s += 50;
+        }
+    }
+    let mine: &[&str] = if arch == "arm64" { &ARM64 } else { &X64 };
+    if w.iter().any(|x| mine.contains(&x.as_str())) {
+        s += 20;
+    }
+    // Flatpak bundles need Flatpak itself; installers want to be run as setup.
+    if w.iter().any(|x| x == "flatpak") {
+        s -= 40;
+    }
+    if w.iter().any(|x| matches!(x.as_str(), "setup" | "installer" | "install")) {
+        s -= 15;
+    }
+    s += match (os, k) {
+        ("windows", "zip") => 12,
+        ("windows", "7z") => 10,
+        ("windows", "exe") => 6,
+        ("windows", "msi") => 2,
+        ("linux", "appimage") => 14,
+        ("linux", "tar.gz" | "tar.xz" | "tar.zst") => 12,
+        ("linux", "zip") => 8,
+        ("macos", "zip") => 12,
+        // Below a ZIP even when the disk image's name says more (arm64): a ZIP keeps the app as it is.
+        ("macos", "dmg") => -20,
+        _ => 4,
+    };
+    // A game's server (for playing online) comes with some releases: the game itself comes first,
+    // and the server only when it's all there is. The same for an editor or tools beside the game.
+    if w.iter().any(|x| matches!(x.as_str(), "server" | "dedicated" | "srv" | "editor" | "tools" | "toolkit" | "sdk" | "modkit" | "devkit")) {
+        s -= 60;
+    }
+    // Anything that can run here stays a build, however it's packed: a lone Game-Setup.exe or a
+    // .dmg with no system in its name is still the game. Lifted above zero with the order kept, so
+    // the best of them still wins.
+    s + 1000
+}
+
+/// A list's pattern naming only builds for another processor is ignored, as in `pick`.
+fn pool<'a>(assets: &'a [Asset], arch: &str, pattern: Option<&str>) -> Vec<&'a Asset> {
+    let Some(p) = pattern.filter(|p| !p.trim().is_empty()) else {
+        return assets.iter().collect();
+    };
+    let named = matching(assets, p);
+    let only_other_arch = !named.is_empty() && named.iter().all(|a| other_arch(&a.name, arch));
+    if only_other_arch {
+        return assets.iter().collect();
+    }
+    named
+}
+
+/// The build for this PC, or None when the release has none.
+/// Builds of one release that are equally good for this PC and differ only in what they're for (one
+/// per region, say: Game-JP and Game-US). The player picks; one alone needs no choice.
+pub fn choices<'a>(assets: &'a [Asset], os: &str, arch: &str, pattern: Option<&str>) -> Vec<&'a Asset> {
+    let pool = pool(assets, arch, pattern);
+    let best = pool.iter().map(|a| score(&a.name, os, arch)).max().unwrap_or(i32::MIN);
+    if best <= 0 {
+        return vec![];
+    }
+    without_copies(pool.into_iter().filter(|a| score(&a.name, os, arch) == best).collect())
+}
+
+/// A release's name for a file, less its version: Game-1.2.0-x86_64.AppImage and
+/// Game-x86_64.AppImage both read game-x86-64.appimage.
+pub(crate) fn unversioned(name: &str) -> String {
+    name.split(['-', '_', ' ']).filter(|w| !is_version(w)).collect::<Vec<_>>().join("-").to_lowercase()
+}
+
+/// A part of a file's name that is its version: 1.5.4, v2, 20261116.
+fn is_version(part: &str) -> bool {
+    let part = part.strip_prefix(['v', 'V']).unwrap_or(part);
+    part.chars().any(|c| c.is_ascii_digit()) && part.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+fn names_a_version(name: &str) -> bool {
+    name.split(['-', '_', ' ']).any(is_version)
+}
+
+/// The same file uploaded twice, once by a name without the version for releases/latest/download
+/// links (Theme-Park-World-1.5.4-x86_64.AppImage and Theme-Park-World-x86_64.AppImage): one build,
+/// not two to choose between. GitHub's SHA-256 says so; an older upload without one, the same size
+/// and the same name but the version.
+fn same_file(a: &Asset, b: &Asset) -> bool {
+    if let (Some(x), Some(y)) = (&a.digest, &b.digest) {
+        return x == y;
+    }
+    let one_unversioned = names_a_version(&a.name) != names_a_version(&b.name);
+    a.size == b.size && one_unversioned && unversioned(&a.name) == unversioned(&b.name)
+}
+
+/// One of each file uploaded under two names, the one whose name says its version kept.
+fn without_copies(list: Vec<&Asset>) -> Vec<&Asset> {
+    let mut out: Vec<&Asset> = Vec::new();
+    for a in list {
+        let Some(i) = out.iter().position(|b| same_file(a, b)) else {
+            out.push(a);
+            continue;
+        };
+        if a.name.len() > out[i].name.len() {
+            out[i] = a;
+        }
+    }
+    out
+}
+
+/// Every build of a release that can run here, best first: every format (an AppImage and a plain
+/// folder, a portable zip and an installer) and 32-bit builds too. A game server is left out unless
+/// it's all there is. With a pattern from the list, only what it matches.
+pub fn all_for<'a>(assets: &'a [Asset], os: &str, arch: &str, pattern: Option<&str>) -> Vec<&'a Asset> {
+    let pool = pool(assets, arch, pattern);
+    let mut v: Vec<(i32, &Asset)> = pool.into_iter().map(|a| (score(&a.name, os, arch), a)).filter(|(s, _)| *s != i32::MIN).collect();
+    let server = |a: &Asset| words(&a.name).iter().any(|x| matches!(x.as_str(), "server" | "dedicated" | "srv"));
+    if v.iter().any(|(_, a)| !server(a)) {
+        v.retain(|(_, a)| !server(a));
+    }
+    // A save editor shipped beside the game is not another game build. Keep it available when
+    // the catalog deliberately names only the editor, or it is the only matching program.
+    let save_editor = |a: &Asset| words(&a.name).windows(2).any(|w| w[0] == "save" && w[1] == "editor");
+    if v.iter().any(|(_, a)| !save_editor(a)) {
+        v.retain(|(_, a)| !save_editor(a));
+    }
+    // A Windows Installer package only when there's nothing else for this PC: not one more form
+    // of build to ask about.
+    let msi = |a: &Asset| a.name.to_lowercase().ends_with(".msi");
+    if v.iter().any(|(_, a)| !msi(a)) {
+        v.retain(|(_, a)| !msi(a));
+    }
+    // A Mac disk image only when there's no ZIP of the same game.
+    let dmg = |a: &Asset| a.name.to_lowercase().ends_with(".dmg");
+    if v.iter().any(|(_, a)| !dmg(a)) {
+        v.retain(|(_, a)| !dmg(a));
+    }
+    // When a release says which files are for this system, a file that says nothing is for another.
+    if v.iter().any(|(_, a)| says_os(&a.name, os)) {
+        v.retain(|(_, a)| says_os(&a.name, os));
+    }
+    v.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.name.cmp(&y.1.name)));
+    without_copies(v.into_iter().map(|(_, a)| a).collect())
+}
+
+/// Does the file's name (or its kind: a .exe, an AppImage, a .dmg) say it's for `os`?
+pub(crate) fn says_os(name: &str, os: &str) -> bool {
+    let w = words(name);
+    let by_kind = matches!((os, kind(name).unwrap_or("")), ("windows", "exe") | ("linux", "appimage") | ("macos", "dmg"));
+    by_kind || OS_WORDS.iter().any(|(o, list)| *o == os && w.iter().any(|x| list.contains(&x.as_str())))
+}
+
+/// What kind of build it is, for the player choosing one: its format, and 32-bit when it is.
+pub fn describe(name: &str, os: &str) -> &'static str {
+    let w = words(name);
+    let has = |l: &[&str]| w.iter().any(|x| l.contains(&x.as_str()));
+    let bit32 = has(&["x86", "i386", "i686", "win32", "32bit"]) && !has(&X64);
+    match (os, kind(name).unwrap_or("")) {
+        (_, _) if has(&["flatpak"]) => "Flatpak",
+        ("linux", "appimage") => "AppImage",
+        ("linux", _) => "Linux Folder",
+        ("windows", "msi") => "Installer",
+        ("windows", "exe") if has(&["setup", "installer", "install"]) => if bit32 { "32-Bit Installer" } else { "Installer" },
+        ("windows", "exe") => if bit32 { "32-Bit Program" } else { "Program" },
+        ("windows", _) => if bit32 { "32-Bit Portable" } else { "Portable" },
+        _ => "Build",
+    }
+}
+
+/// Of `list`, the one most like `before` (the build the player had): same words but the version.
+pub fn most_like<'a>(list: &[&'a Asset], before: &str) -> Option<&'a Asset> {
+    let had = words(before);
+    // Of equally close names, the first (lists come best first).
+    list.iter().copied().rev().max_by_key(|a| words(&a.name).iter().filter(|w| had.contains(w) && !w.chars().all(|c| c.is_ascii_digit() || c == '.')).count())
+}
+
+/// The files a list's name pattern means in this release. A name with no wildcards that isn't
+/// here also matches the same name with other numbers in it: a list pointing at last week's
+/// "Folklore-20261107-1109.zip" finds "Folklore-20261108-1524.zip", but not "..._eu.zip".
+fn matching<'a>(assets: &'a [Asset], p: &str) -> Vec<&'a Asset> {
+    let exact: Vec<&Asset> = assets.iter().filter(|a| wild(p, &a.name)).collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    // GitHub turns a space in an uploaded file's name into a dot, and developers switch between
+    // dots, dashes and underscores from one release to the next (Sky.Racer-Setup-1.14.2 after
+    // Sky-Racer-Setup-1.13.0): those count as the same, so a list written for one release still
+    // finds the next one's file.
+    let loose: Vec<&Asset> = assets.iter().filter(|a| wild(&seps(p), &seps(&a.name))).collect();
+    if !loose.is_empty() || p.contains(['*', '?']) || !p.chars().any(|c| c.is_ascii_digit()) {
+        return loose;
+    }
+    assets.iter().filter(|a| same_shape(p, &a.name)).collect()
+}
+
+/// A name with its separators made one: dots, dashes, underscores and spaces are all "-".
+fn seps(s: &str) -> String {
+    s.chars().map(|c| if matches!(c, '.' | '_' | ' ') { '-' } else { c }).collect()
+}
+
+/// Two names alike but for their numbers: each run of digits in one is a run of digits in the other.
+fn same_shape(a: &str, b: &str) -> bool {
+    fn parts(s: &str) -> Vec<(bool, String)> {
+        let mut v: Vec<(bool, String)> = vec![];
+        for c in s.to_lowercase().chars() {
+            let d = c.is_ascii_digit();
+            match v.last_mut() {
+                Some((ld, t)) if *ld == d => t.push(c),
+                _ => v.push((d, c.to_string())),
+            }
+        }
+        v
+    }
+    let (x, y) = (parts(a), parts(b));
+    x.len() == y.len() && x.iter().zip(&y).all(|((dx, tx), (dy, ty))| dx == dy && (*dx || tx == ty))
+}
+
+pub fn pick<'a>(assets: &'a [Asset], os: &str, arch: &str, pattern: Option<&str>) -> Option<&'a Asset> {
+    if let Some(p) = pattern.filter(|p| !p.trim().is_empty()) {
+        let named = matching(assets, p);
+        let usable: Vec<&Asset> = named
+            .iter()
+            .copied()
+            .filter(|a| !other_arch(&a.name, arch) && !not_a_build(&a.name) && !for_other_platform(&a.name))
+            .filter(|a| usable_file(os, &a.name))
+            .collect();
+        let best = best_by(usable, |a| score(&a.name, os, arch).max(0));
+        if best.is_some() {
+            return best;
+        }
+        // The list says what this system's file is called, and nothing in this release is: it has
+        // no build for this system (an older release that does is used instead). Only when the
+        // pattern names a file that's there but for another processor (a list pointing at the ARM
+        // build) is the best guess used.
+        if named.is_empty() {
+            return None;
+        }
+    }
+    let builds: Vec<&Asset> = assets.iter().filter(|a| score(&a.name, os, arch) > 0).collect();
+    best_by(builds, |a| score(&a.name, os, arch))
+}
+
+/// The best-scoring file, the last of equals, as ever. A file uploaded twice counts once, by its
+/// versioned name (without_copies), so pick, choices and all_for name the same copy.
+fn best_by<'a>(list: Vec<&'a Asset>, key: impl Fn(&Asset) -> i32) -> Option<&'a Asset> {
+    let top = list.iter().map(|a| key(a)).max()?;
+    let tied: Vec<&Asset> = list.into_iter().filter(|a| key(a) == top).collect();
+    without_copies(tied).into_iter().last()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_list_pattern_finds_the_file_when_dots_and_dashes_trade_places() {
+        let a = |n: &str| Asset { name: n.into(), size: 1, digest: None, browser_download_url: String::new(), url: None };
+        let rel = [a("Game-Setup-1.13.0-x86_64.AppImage"), a("Game-Setup-1.13.0-windows.zip")];
+        let got = pick(&rel, "windows", "x64", Some("Game.Setup-*-windows.zip")).map(|x| x.name.clone());
+        assert_eq!(got.as_deref(), Some("Game-Setup-1.13.0-windows.zip"));
+        let rel = [a("My.Game_v2-win64.zip")];
+        assert!(pick(&rel, "windows", "x64", Some("My Game-v*-win64.zip")).is_some());
+        // Still nothing for this system when no name is alike.
+        let rel = [a("Other-1.0-linux.AppImage")];
+        assert!(pick(&rel, "windows", "x64", Some("Game.Setup-*-windows.zip")).is_none());
+    }
+
+    #[test]
+    fn a_lone_setup_or_disk_image_is_still_the_build() {
+        let a = |n: &str| Asset { name: n.into(), size: 1, digest: None, browser_download_url: String::new(), url: None };
+        let rel = [a("RE-Amped2-Setup.exe"), a("RE-Amped2-0.3.1-linux.tar.gz"), a("RE-Amped2-0.3.1-linux.tar.gz.sha256")];
+        assert_eq!(pick(&rel, "windows", "x64", None).map(|x| x.name.as_str()), Some("RE-Amped2-Setup.exe"));
+        assert_eq!(pick(&rel, "linux", "x64", None).map(|x| x.name.as_str()), Some("RE-Amped2-0.3.1-linux.tar.gz"));
+        let two = [a("Game-Setup.exe"), a("Game-Server-Setup.exe")];
+        assert_eq!(pick(&two, "windows", "x64", None).map(|x| x.name.as_str()), Some("Game-Setup.exe"));
+        assert_eq!(choices(&two, "windows", "x64", None).len(), 1);
+        let msi = [a("Game-Setup.exe"), a("Game-Setup.msi")];
+        assert_eq!(choices(&msi, "windows", "x64", None).iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), vec!["Game-Setup.exe"]);
+        let srv = [a("Game-Server.zip")];
+        assert_eq!(pick(&srv, "windows", "x64", None).map(|x| x.name.as_str()), Some("Game-Server.zip"));
+        let mac = [a("Game.dmg")];
+        assert_eq!(pick(&mac, "macos", "arm64", None).map(|x| x.name.as_str()), Some("Game.dmg"));
+    }
+
+    #[test]
+    fn mac_zip_comes_first_and_a_dmg_works_alone() {
+        let files = [a("Game-macOS.dmg"), a("Game-macOS.zip")];
+        assert_eq!(all_for(&files, "macos", "arm64", None).iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), vec!["Game-macOS.zip"]);
+        assert_eq!(pick(&files, "macos", "arm64", None).unwrap().name, "Game-macOS.zip");
+        let files = [a("Game-1.0-macOS-arm64.dmg"), a("Game-1.0-macOS.zip")];
+        assert_eq!(pick(&files, "macos", "arm64", None).unwrap().name, "Game-1.0-macOS.zip");
+        assert_eq!(pick(&files[..1], "macos", "arm64", None).unwrap().name, "Game-1.0-macOS-arm64.dmg");
+        // Only a disk image (Link's Awakening's release): that's the one.
+        let files = [a("LAS.Recomp-1.0-macOS.dmg"), a("LAS.Recomp-1.0-Windows.zip")];
+        assert_eq!(pick(&files, "macos", "arm64", None).unwrap().name, "LAS.Recomp-1.0-macOS.dmg");
+        assert_eq!(pick(&files, "macos", "arm64", Some("LAS.Recomp-*-macOS.dmg")).unwrap().name, "LAS.Recomp-1.0-macOS.dmg");
+        assert!(pick(&files, "windows", "x64", None).unwrap().name.ends_with("Windows.zip"));
+    }
+
+    #[test]
+    fn mac_rar_and_7z_are_builds() {
+        // SMW Remastered Plus ships its Mac build as a .rar.
+        assert_eq!(pick(&[a("SMW.Remastered+.MacOS.Untested.rar")], "macos", "arm64", Some("SMW.Remastered+.MacOS.Untested.rar")).unwrap().name, "SMW.Remastered+.MacOS.Untested.rar");
+        assert!(pick(&[a("Game-macOS.7z")], "macos", "arm64", None).is_some());
+        // A ZIP of the same game still comes first.
+        assert_eq!(pick(&[a("Game-macOS.rar"), a("Game-macOS.zip")], "macos", "arm64", None).unwrap().name, "Game-macOS.zip");
+        // Still not a Mac build: Windows and Linux files.
+        assert!(pick(&[a("Game-windows.rar"), a("Game-linux.tar.gz")], "macos", "arm64", None).is_none());
+    }
+
+    fn a(n: &str) -> Asset {
+        Asset { name: n.into(), size: 1, digest: None, browser_download_url: String::new(), url: None }
+    }
+
+    fn file(n: &str, size: u64, digest: Option<&str>) -> Asset {
+        Asset { name: n.into(), size, digest: digest.map(String::from), browser_download_url: String::new(), url: None }
+    }
+
+    /// tpw-recomp v1.5.4: each AppImage and the Mac zip twice, once without the version.
+    fn tpw_1_5_4() -> Vec<Asset> {
+        vec![
+            file("Theme-Park-World-1.5.4-aarch64.AppImage", 142739976, Some("sha256:aa")),
+            file("Theme-Park-World-1.5.4-x86_64.AppImage", 161954296, Some("sha256:bb")),
+            file("Theme-Park-World-1.5.4.zip", 40083153, Some("sha256:cc")),
+            file("Theme-Park-World-aarch64.AppImage", 142739976, Some("sha256:aa")),
+            file("Theme-Park-World-x86_64.AppImage", 161954296, Some("sha256:bb")),
+            file("Theme-Park-World.zip", 40083153, Some("sha256:cc")),
+        ]
+    }
+
+    #[test]
+    fn the_same_file_under_two_names_is_one_build() {
+        let rel = tpw_1_5_4();
+        let names = |v: Vec<&Asset>| v.iter().map(|x| x.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(choices(&rel, "linux", "x64", None)), ["Theme-Park-World-1.5.4-x86_64.AppImage"]);
+        assert_eq!(names(all_for(&rel, "linux", "x64", None)), ["Theme-Park-World-1.5.4-x86_64.AppImage"]);
+        assert_eq!(names(all_for(&rel, "linux", "arm64", None)), ["Theme-Park-World-1.5.4-aarch64.AppImage"]);
+        assert_eq!(names(choices(&rel, "macos", "arm64", None)), ["Theme-Park-World-1.5.4.zip"]);
+        // The file installed is the same copy the choices name, whichever comes last in the list.
+        let mut reversed = rel.clone();
+        reversed.reverse();
+        assert_eq!(pick(&rel, "linux", "x64", None).unwrap().name, "Theme-Park-World-1.5.4-x86_64.AppImage");
+        assert_eq!(pick(&reversed, "linux", "x64", None).unwrap().name, "Theme-Park-World-1.5.4-x86_64.AppImage");
+        assert_eq!(pick(&rel, "macos", "arm64", Some("Theme-Park-World*.zip")).unwrap().name, "Theme-Park-World-1.5.4.zip");
+    }
+
+    #[test]
+    fn an_upload_without_a_digest_is_a_copy_by_its_size_and_name() {
+        let rel = [file("Game-2.0-x86_64.AppImage", 500, None), file("Game-x86_64.AppImage", 500, None)];
+        assert_eq!(all_for(&rel, "linux", "x64", None).len(), 1);
+        assert_eq!(choices(&rel, "linux", "x64", None)[0].name, "Game-2.0-x86_64.AppImage");
+    }
+
+    #[test]
+    fn different_files_stay_choices() {
+        // Two versions of the same size, both named: not a copy of each other.
+        let rel = [file("Game-1.0-linux.tar.gz", 500, None), file("Game-1.1-linux.tar.gz", 500, None)];
+        assert_eq!(all_for(&rel, "linux", "x64", None).len(), 2);
+        // The same names, but GitHub's SHA-256 says the bytes differ.
+        let rel = [file("Game-2.0-x86_64.AppImage", 500, Some("sha256:aa")), file("Game-x86_64.AppImage", 500, Some("sha256:bb"))];
+        assert_eq!(all_for(&rel, "linux", "x64", None).len(), 2);
+        // The same size, without the version, but another name.
+        let rel = [file("Game-JP-x86_64.AppImage", 500, None), file("Game-US-2.0-x86_64.AppImage", 500, None)];
+        assert_eq!(all_for(&rel, "linux", "x64", None).len(), 2);
+    }
+
+    #[test]
+    fn sixty_four_bit_names_and_editor_builds() {
+        // x86_64 is 64-bit, not 32.
+        assert_eq!(describe("orchid-v0.7.5-windows-x86_64.zip", "windows"), "Portable");
+        assert_eq!(describe("game-win32.zip", "windows"), "32-Bit Portable");
+        assert!(other_arch("game-linux-x86_64.AppImage", "arm64"));
+        assert!(!other_arch("game-linux-x86_64.AppImage", "x64"));
+        // The game before its editor.
+        let r = [a("fm-editor-v0.3.1-preview.1-windows.zip"), a("memories-pc-v0.3.1-preview.1-windows.zip")];
+        assert_eq!(pick(&r, "windows", "x64", None).unwrap().name, "memories-pc-v0.3.1-preview.1-windows.zip");
+        assert_eq!(all_for(&r, "windows", "x64", None).len(), 2);
+        // An editor alone is still picked.
+        assert_eq!(pick(&r[..1], "windows", "x64", None).unwrap().name, "fm-editor-v0.3.1-preview.1-windows.zip");
+    }
+
+    #[test]
+    fn parasite_eve_build_choices_do_not_include_its_save_editor() {
+        let rel = [a("Parasite-Eve-0.12-linux-x86_64.tar.gz"), a("Parasite-Eve-Save-Editor-0.12-linux-x86_64.tar.gz")];
+        let builds = all_for(&rel, "linux", "x64", Some("Parasite-Eve-*-linux-x86_64.tar.gz"));
+        assert_eq!(builds.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["Parasite-Eve-0.12-linux-x86_64.tar.gz"]);
+    }
+
+    #[test]
+    fn an_explicit_save_editor_pattern_still_selects_the_editor() {
+        let rel = [a("Parasite-Eve-0.12-linux-x86_64.tar.gz"), a("Parasite-Eve-Save-Editor-0.12-linux-x86_64.tar.gz")];
+        let builds = all_for(&rel, "linux", "x64", Some("Parasite-Eve-Save-Editor-*-linux-x86_64.tar.gz"));
+        assert_eq!(builds.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["Parasite-Eve-Save-Editor-0.12-linux-x86_64.tar.gz"]);
+    }
+
+    #[test]
+    fn a_save_editor_without_a_game_build_is_still_available() {
+        let rel = [a("Game-Save-Editor-v1.0-windows.zip")];
+        assert_eq!(all_for(&rel, "windows", "x64", None), vec![&rel[0]]);
+    }
+
+    #[test]
+    fn a_files_name_says_which_system_it_is_for() {
+        assert!(says_os("Parasite-Eve-0.11-linux-x86_64.tar.gz", "linux"));
+        assert!(says_os("Game.AppImage", "linux"));
+        assert!(says_os("Game-macOS.zip", "macos"));
+        assert!(says_os("Game.dmg", "macos"));
+        assert!(says_os("Game-windows-x64.zip", "windows"));
+        assert!(says_os("Game-Setup.exe", "windows"));
+        // A plain ZIP could be for any system: the list's pattern or the best guess decides.
+        assert!(!says_os("Game.zip", "linux"));
+        // A Linux build is never a Windows one.
+        assert!(!says_os("Game-linux.tar.gz", "windows"));
+    }
+
+    #[test]
+    fn rar_and_windows_tarballs_are_builds() {
+        assert_eq!(pick(&[a("release.rar")], "windows", "x64", Some("release.rar")).map(|x| x.name.as_str()), Some("release.rar"));
+        assert_eq!(pick(&[a("bloodyextreme.rar")], "windows", "x64", None).map(|x| x.name.as_str()), Some("bloodyextreme.rar"));
+        let tmc = [a("tmc-multi-linux-x86_64-v0.9.6.tar.gz"), a("tmc-multi-windows-arm64-v0.9.6.tar.gz"), a("tmc-multi-windows-x86_64-v0.9.6.tar.gz"), a("tmc-multi-android-v0.9.6.apk")];
+        assert_eq!(pick(&tmc, "windows", "x64", Some("tmc-multi-windows-x86_64-*.tar.gz")).map(|x| x.name.as_str()), Some("tmc-multi-windows-x86_64-v0.9.6.tar.gz"));
+        assert_eq!(pick(&tmc, "windows", "x64", None).map(|x| x.name.as_str()), Some("tmc-multi-windows-x86_64-v0.9.6.tar.gz"));
+        // A tarball that doesn't say Windows is still Linux's.
+        assert!(pick(&[a("Game-1.0.tar.gz")], "windows", "x64", None).is_none());
+        // An updater's files alone are no build.
+        assert!(pick(&[a("update.json"), a("update.json.sig")], "windows", "x64", None).is_none());
+    }
+
+    #[test]
+    fn every_format_for_this_system_is_offered() {
+        let rel = [a("Game-1.0-linux-x86_64.AppImage"), a("Game-1.0-linux-x86_64.tar.gz"), a("Game-1.0-windows-x64.zip"), a("Game-1.0-Setup.exe"), a("Game-1.0-win32.zip"), a("Game-server-linux.tar.gz"), a("Game-1.0.pdb")];
+        let l: Vec<&str> = all_for(&rel, "linux", "x64", None).iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(l, vec!["Game-1.0-linux-x86_64.AppImage", "Game-1.0-linux-x86_64.tar.gz"]);
+        let w: Vec<&str> = all_for(&rel, "windows", "x64", None).iter().map(|x| describe(&x.name, "windows")).collect();
+        assert_eq!(w, vec!["Portable", "32-Bit Portable", "Installer"]);
+        assert_eq!(describe("Game-1.0-linux-x86_64.tar.gz", "linux"), "Linux Folder");
+        // A release that names its Linux files: the unnamed zip is for Windows.
+        let named = [a("Game.AppImage"), a("Game.zip")];
+        assert_eq!(all_for(&named, "linux", "x64", None).len(), 1);
+        let unnamed = [a("Game.tar.gz"), a("Game.zip")];
+        assert_eq!(all_for(&unnamed, "linux", "x64", None).len(), 2);
+    }
+
+    #[test]
+    fn the_game_before_its_server() {
+        let r = [a("ttt2-server-0.1.7-windows-amd64.zip"), a("ttt2-0.1.7-windows-amd64.zip")];
+        assert_eq!(pick(&r, "windows", "x64", None).unwrap().name, "ttt2-0.1.7-windows-amd64.zip");
+        let r2 = [a("ttt2-0.1.7-windows-amd64.zip"), a("ttt2-server-0.1.7-windows-amd64.zip")];
+        assert_eq!(pick(&r2, "windows", "x64", None).unwrap().name, "ttt2-0.1.7-windows-amd64.zip");
+        let only = [a("ttt2-server-0.1.7-windows-amd64.zip")];
+        assert!(pick(&only, "windows", "x64", None).is_some());
+    }
+
+    #[test]
+    fn a_dated_name_in_the_list_finds_the_next_release() {
+        let rel = [a("Folklore-20261108-1524.zip"), a("Folklore-20261108-1524_1.10.zip"), a("Folklore-20261108-1524_eu.zip"), a("Folklore-20261108-1524_eu_1.10.zip")];
+        assert_eq!(pick(&rel, "windows", "x64", Some("Folklore-20261107-1109.zip")).map(|x| x.name.as_str()), Some("Folklore-20261108-1524.zip"));
+        assert!(pick(&rel, "windows", "x64", Some("Other-20261107.zip")).is_none());
+        assert!(same_shape("Game-v1.2.zip", "Game-v1.10.zip") && !same_shape("Game-v1.2.zip", "Game-v1.2-eu.zip"));
+    }
+
+    #[test]
+    fn a_releases_build_tools_are_never_the_game() {
+        let rel = [a("FidelityFX-SDK-v2.4.0.zip"), a("llvm-mingw-20261006-ucrt-x86_64.zip"), a("SDL3-devel-3.4.18-mingw.tar.gz"), a("FidelityFX-SDK-license.md")];
+        assert!(pick(&rel, "windows", "x64", None).is_none());
+        assert!(pick(&rel, "linux", "x64", None).is_none());
+        assert!(pick(&rel, "windows", "x64", Some("llvm-mingw-20261006-ucrt-x86_64.zip")).is_none());
+        // A game built with MinGW is still the game.
+        assert!(pick(&[a("Game-windows-mingw.zip")], "windows", "x64", None).is_some());
+    }
+
+    #[test]
+    fn wildcards() {
+        assert!(wild("Zelda64Recompiled-*-Windows.zip", "Zelda64Recompiled-v1.2.2-Windows.zip"));
+        assert!(wild("ssbu-*053.zip", "SSBU-runtime-daa0053.zip"));
+        assert!(!wild("Foo-*.zip", "Foo-1.7z"));
+        assert!(wild("*", "anything"));
+        assert!(wild("a?c", "abc"));
+    }
+
+    #[test]
+    fn zelda_linux_pattern_points_at_arm_but_x64_wins() {
+        let r = [a("Zelda64Recompiled-v1.2.2-Linux-ARM64.zip"), a("Zelda64Recompiled-v1.2.2-Linux-Flatpak-X64.zip"), a("Zelda64Recompiled-v1.2.2-Linux-X64.zip"), a("Zelda64Recompiled-v1.2.2-Windows.zip"), a("Zelda64Recompiled-v1.2.2-macOS.zip")];
+        assert_eq!(pick(&r, "linux", "x64", Some("Zelda64Recompiled-*-Linux-ARM64.zip")).unwrap().name, "Zelda64Recompiled-v1.2.2-Linux-X64.zip");
+        assert_eq!(pick(&r, "windows", "x64", Some("Zelda64Recompiled-*-Windows.zip")).unwrap().name, "Zelda64Recompiled-v1.2.2-Windows.zip");
+        assert_eq!(pick(&r, "linux", "arm64", Some("Zelda64Recompiled-*-Linux-ARM64.zip")).unwrap().name, "Zelda64Recompiled-v1.2.2-Linux-ARM64.zip");
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_means_no_build() {
+        let r = [a("Game-2.0-win64.zip"), a("Game-2.0-linux.AppImage"), a("Game-2.0-symbols.zip"), a("Source code.zip")];
+        // The list says what the Windows file is called and this release has none: no build here
+        // (an older release that has one is installed instead). Without a pattern, the best guess.
+        assert!(pick(&r, "windows", "x64", Some("Game-1.*-Windows.zip")).is_none());
+        assert_eq!(pick(&r, "windows", "x64", None).unwrap().name, "Game-2.0-win64.zip");
+        assert_eq!(pick(&r, "linux", "x64", None).unwrap().name, "Game-2.0-linux.AppImage");
+    }
+
+    #[test]
+    fn console_and_phone_builds_are_never_for_a_pc() {
+        // Only a Switch build in the newest release, and the list's pattern matches nothing.
+        assert!(pick(&[a("Marchwind64-0.5.3.1-switch.zip")], "windows", "x64", Some("Marchwind64-*-windows-x64.zip")).is_none());
+        assert!(pick(&[a("Marchwind64-0.5.3.1-switch.zip")], "windows", "x64", None).is_none());
+        assert!(pick(&[a("Marchwind64-0.5.3.1-switch.zip")], "linux", "x64", None).is_none());
+        let r = [a("Game-1.0-android-arm64.apk"), a("Game-1.0-windows-x64.zip")];
+        assert_eq!(pick(&r, "windows", "x64", None).unwrap().name, "Game-1.0-windows-x64.zip");
+        assert_eq!(all_for(&[a("Game-1.0-ps5.zip"), a("Game-1.0-win64.zip")], "windows", "x64", None).len(), 1);
+        assert!(choices(&[a("Game-v2-nx.zip")], "windows", "x64", None).is_empty());
+        // Console words in a game's own name are its name, not a platform.
+        assert_eq!(pick(&[a("Xbox 360 Something-windows.zip")], "windows", "x64", None).unwrap().name, "Xbox 360 Something-windows.zip");
+        assert_eq!(pick(&[a("Wii Sports Recomp-1.2-windows-x64.zip")], "windows", "x64", None).unwrap().name, "Wii Sports Recomp-1.2-windows-x64.zip");
+        assert_eq!(pick(&[a("PS2 Racer 2.0-win64.zip")], "windows", "x64", None).unwrap().name, "PS2 Racer 2.0-win64.zip");
+        // A later version word isn't a platform: xbox360 as one word stays in.
+        assert_eq!(pick(&[a("Game-1.0-xbox360-windows.zip")], "windows", "x64", None).unwrap().name, "Game-1.0-xbox360-windows.zip");
+    }
+
+    #[test]
+    fn nothing_for_this_system() {
+        let r = [a("Game-macOS.dmg"), a("Game-Linux.tar.gz")];
+        assert!(pick(&r, "windows", "x64", None).is_none());
+        assert!(pick(&r, "macos", "arm64", None).is_some());
+    }
+
+    #[test]
+    fn plain_zip_when_it_is_the_only_one() {
+        let r = [a("nectar-windows.zip")];
+        assert_eq!(pick(&r, "windows", "x64", Some("nectar-windows.zip")).unwrap().name, "nectar-windows.zip");
+        let r = [a("UnleashedRecomp-Windows.zip"), a("UnleashedRecomp-Flatpak.zip")];
+        assert_eq!(pick(&r, "linux", "x64", Some("UnleashedRecomp-Flatpak.zip")).unwrap().name, "UnleashedRecomp-Flatpak.zip");
+    }
+
+    fn ja2_0_22_1() -> Vec<Asset> {
+        ["aarch64.AppImage", "android.apk", "armhf.AppImage", "macos.dmg", "win-mingw64-cross.zip", "win-msvc64-142.zip", "x86-64.AppImage"]
+            .iter()
+            .map(|end| a(&format!("ja2-stracciatella_0.22.1-git+11e9430_{end}")))
+            .collect()
+    }
+
+    const JA2_ARMHF: &str = "ja2-stracciatella_*-git+11e9430_armhf.AppImage";
+
+    #[test]
+    fn a_list_naming_the_armhf_build_installs_the_pcs_build() {
+        let rel = ja2_0_22_1();
+        assert_eq!(pick(&rel, "linux", "x64", Some(JA2_ARMHF)).unwrap().name, "ja2-stracciatella_0.22.1-git+11e9430_x86-64.AppImage");
+    }
+
+    #[test]
+    fn a_list_naming_the_armhf_build_installs_the_arm64_build_on_arm64() {
+        let rel = ja2_0_22_1();
+        assert_eq!(pick(&rel, "linux", "arm64", Some(JA2_ARMHF)).unwrap().name, "ja2-stracciatella_0.22.1-git+11e9430_aarch64.AppImage");
+    }
+
+    #[test]
+    fn change_build_lists_the_pcs_build_when_the_list_names_the_armhf_one() {
+        let rel = ja2_0_22_1();
+        let names: Vec<&str> = all_for(&rel, "linux", "x64", Some(JA2_ARMHF)).iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["ja2-stracciatella_0.22.1-git+11e9430_x86-64.AppImage"]);
+    }
+}

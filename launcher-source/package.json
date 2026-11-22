@@ -1,0 +1,17 @@
+{
+  "name": "recomplauncher",
+  "version": "0.90.0-beta.68",
+  "private": true,
+  "description": "Recompiled and decompiled PC games: find, install, update and play them from each developer's own GitHub.",
+  "license": "GPL-3.0-or-later",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:macos": "tauri build --target aarch64-apple-darwin --bundles app,dmg",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4"
+  }
+}
